@@ -6,7 +6,7 @@ import google.generativeai as genai
 
 app = FastAPI(title="Sahayak AI Service")
 
-# CORS middleware add kiya hai taaki Odoo se requests allow ho sake
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +17,7 @@ app.add_middleware(
 
 # Retrieve API keys securely from environment variables
 ODOO_API_KEY = os.getenv("sahayak-ai-odoo")
-GEMINI_API_KEY = os.getenv("sahayak-ai")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Configure Gemini AI client safely
 if GEMINI_API_KEY:
@@ -64,13 +64,12 @@ def odoo_status():
         "message": "Odoo API key is active and recognized."
     }
 
-# Device connectivity status check karne ke liye GET endpoint
 @app.get("/api/device-status")
 def get_device_status():
     return {"isConnected": device_state["isConnected"]}
 
-# Device status toggle karne ke liye POST endpoint
 @app.post("/api/device-status")
 def toggle_device_status():
     device_state["isConnected"] = not device_state["isConnected"]
     return {"isConnected": device_state["isConnected"]}
+
