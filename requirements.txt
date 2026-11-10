@@ -1,1 +1,4 @@
-fastapi, uvicorn, requests,python-dotenvi
+fastapi
+uvicorn
+requests
+python-dotenv
