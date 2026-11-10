@@ -1,13 +1,19 @@
-from fastapi import FastAPI 
-app = FastAPI()
 import os
-odoo_api_key = os.getenv('sahayak-ai-odoo')
-import os
-import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import google.generativeai as genai
 
 app = FastAPI(title="Sahayak AI Service")
+
+# CORS middleware add kiya hai taaki Odoo se requests allow ho sake
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Retrieve API keys securely from environment variables
 ODOO_API_KEY = os.getenv("sahayak-ai-odoo")
@@ -21,6 +27,9 @@ else:
 
 class PromptRequest(BaseModel):
     prompt: str
+
+# In-memory device status state
+device_state = {"isConnected": False}
 
 @app.get("/")
 def read_root():
@@ -54,3 +63,14 @@ def odoo_status():
         "status": "connected",
         "message": "Odoo API key is active and recognized."
     }
+
+# Device connectivity status check karne ke liye GET endpoint
+@app.get("/api/device-status")
+def get_device_status():
+    return {"isConnected": device_state["isConnected"]}
+
+# Device status toggle karne ke liye POST endpoint
+@app.post("/api/device-status")
+def toggle_device_status():
+    device_state["isConnected"] = not device_state["isConnected"]
+    return {"isConnected": device_state["isConnected"]}
