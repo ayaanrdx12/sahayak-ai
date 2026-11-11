@@ -5,9 +5,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Sahayak_AI")
 
 app = FastAPI(title="Sahayak AI Voice Backend")
 
@@ -15,63 +14,49 @@ app = FastAPI(title="Sahayak AI Voice Backend")
 PRIMARY_LIVE_MODEL = "gemini-3-flash-live"
 
 # Initialize Client
-try:
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-except Exception as e:
-    logger.critical(f"Failed to initialize GenAI client: {e}")
-    client = None
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Sahayak AI Live Service is running"}
 
 @app.websocket("/ws/live")
 async def live_websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    if not client:
-        logger.critical("GenAI client not initialized.")
-        await websocket.close(code=1011)
-        return
+    logger.info("Client connected to WebSocket")
 
-    logger.info("New WebSocket connection accepted.")
-    
-    # Configure the live session
     config = types.LiveConnectConfig(
-        response_modalities=[types.LiveModality.AUDIO]
+        response_modalities=["AUDIO"]
     )
 
     try:
         async with client.aio.live.connect(model=PRIMARY_LIVE_MODEL, config=config) as session:
-            logger.info("Connected to Gemini Live API.")
-            
-            async def send_to_gemini():
+            logger.info("Connected to Gemini Live API session")
+
+            async def receive_from_client():
                 try:
                     while True:
                         data = await websocket.receive_bytes()
-                        await session.send(input=data, end_of_turn=False)
+                        await session.send_realtime_input(
+                            audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
+                        )
                 except WebSocketDisconnect:
-                    logger.info("Client disconnected from WebSocket.")
+                    logger.info("Client disconnected from WebSocket")
                 except Exception as e:
-                    logger.error(f"Error sending to Gemini: {e}")
+                    logger.error(f"Error receiving from client: {e}")
 
             async def receive_from_gemini():
                 try:
                     async for response in session.receive():
-                        server_content = response.server_content
-                        if server_content and server_content.model_turn:
-                            for part in server_content.model_turn.parts:
+                        if response.server_content and response.server_content.model_turn:
+                            for part in response.server_content.model_turn.parts:
                                 if part.inline_data:
                                     await websocket.send_bytes(part.inline_data.data)
                 except Exception as e:
                     logger.error(f"Error receiving from Gemini: {e}")
 
-            # Run send and receive concurrently
-            send_task = asyncio.create_task(send_to_gemini())
-            receive_task = asyncio.create_task(receive_from_gemini())
-            
-            await asyncio.gather(send_task, receive_task)
+            await asyncio.gather(receive_from_client(), receive_from_gemini())
 
     except Exception as e:
-        logger.error(f"Live session error: {e}")
-    finally:
-        try:
-            await websocket.close()
-        except RuntimeError:
-            pass # WebSocket already closed
-        logger.info("WebSocket connection closed.")
+        logger.error(f"Gemini Live session error: {e}")
+        await websocket.close()
