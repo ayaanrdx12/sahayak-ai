@@ -23,7 +23,7 @@ async def chat(request: Request):
         return {"status": "error", "reply": "API Key not configured"}
     
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-3.8-flash')
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
     try:
         response = model.generate_content(message)
