@@ -30,12 +30,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction="आप सहायक AI हैं। हिंदी में जवाब दें, छोटे और सीधे, ज़्यादा से ज़्यादा 1-2 वाक्य।",
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                silence_duration_ms=300,
-            )
-        ),
     )
 
     try:
