@@ -10,12 +10,10 @@ logger = logging.getLogger("Sahayak_AI")
 
 app = FastAPI(title="Sahayak AI Voice Backend")
 
-# Model Definition
 PRIMARY_LIVE_MODEL = os.getenv(
     "LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"
 )
 
-# Initialize Client
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
@@ -30,7 +28,14 @@ async def live_websocket_endpoint(websocket: WebSocket):
     logger.info("Client connected to WebSocket")
 
     config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"]
+        response_modalities=["AUDIO"],
+        system_instruction="आप सहायक AI हैं। हिंदी में जवाब दें, छोटे और सीधे, ज़्यादा से ज़्यादा 1-2 वाक्य।",
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                silence_duration_ms=300,
+            )
+        ),
     )
 
     try:
@@ -57,19 +62,19 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 try:
                     while True:
                         async for response in session.receive():
-                            if (
-                                response.server_content
-                                and response.server_content.model_turn
-                            ):
-                                for part in response.server_content.model_turn.parts:
-                                    if part.inline_data:
-                                        await websocket.send_bytes(
-                                            part.inline_data.data
-                                        )
+                            sc = response.server_content
+                            if sc:
+                                if getattr(sc, "interrupted", False):
+                                    await websocket.send_text("interrupted")
+                                if sc.model_turn:
+                                    for part in sc.model_turn.parts:
+                                        if part.inline_data:
+                                            await websocket.send_bytes(
+                                                part.inline_data.data
+                                            )
                 except Exception as e:
                     logger.error(f"Error receiving from Gemini: {e}")
 
-            # Jab client ya Gemini mein se koi ek band ho, dono band kar do
             tasks = [
                 asyncio.create_task(receive_from_client()),
                 asyncio.create_task(receive_from_gemini()),
