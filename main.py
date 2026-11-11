@@ -11,14 +11,18 @@ logger = logging.getLogger("Sahayak_AI")
 app = FastAPI(title="Sahayak AI Voice Backend")
 
 # Model Definition
-PRIMARY_LIVE_MODEL = "gemini-3-flash-live"
+PRIMARY_LIVE_MODEL = os.getenv(
+    "LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"
+)
 
 # Initialize Client
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Sahayak AI Live Service is running"}
+
 
 @app.websocket("/ws/live")
 async def live_websocket_endpoint(websocket: WebSocket):
@@ -30,7 +34,9 @@ async def live_websocket_endpoint(websocket: WebSocket):
     )
 
     try:
-        async with client.aio.live.connect(model=PRIMARY_LIVE_MODEL, config=config) as session:
+        async with client.aio.live.connect(
+            model=PRIMARY_LIVE_MODEL, config=config
+        ) as session:
             logger.info("Connected to Gemini Live API session")
 
             async def receive_from_client():
@@ -38,7 +44,9 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     while True:
                         data = await websocket.receive_bytes()
                         await session.send_realtime_input(
-                            audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
+                            audio=types.Blob(
+                                data=data, mime_type="audio/pcm;rate=16000"
+                            )
                         )
                 except WebSocketDisconnect:
                     logger.info("Client disconnected from WebSocket")
@@ -47,16 +55,33 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
             async def receive_from_gemini():
                 try:
-                    async for response in session.receive():
-                        if response.server_content and response.server_content.model_turn:
-                            for part in response.server_content.model_turn.parts:
-                                if part.inline_data:
-                                    await websocket.send_bytes(part.inline_data.data)
+                    while True:
+                        async for response in session.receive():
+                            if (
+                                response.server_content
+                                and response.server_content.model_turn
+                            ):
+                                for part in response.server_content.model_turn.parts:
+                                    if part.inline_data:
+                                        await websocket.send_bytes(
+                                            part.inline_data.data
+                                        )
                 except Exception as e:
                     logger.error(f"Error receiving from Gemini: {e}")
 
-            await asyncio.gather(receive_from_client(), receive_from_gemini())
+            # Jab client ya Gemini mein se koi ek band ho, dono band kar do
+            tasks = [
+                asyncio.create_task(receive_from_client()),
+                asyncio.create_task(receive_from_gemini()),
+            ]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in tasks:
+                t.cancel()
 
     except Exception as e:
         logger.error(f"Gemini Live session error: {e}")
-        await websocket.close()
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
