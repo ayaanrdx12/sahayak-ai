@@ -2,4 +2,4 @@ fastapi
 uvicorn
 requests
 python-dotenv
-google-genai
+google-genail>=3.1.0
