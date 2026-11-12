@@ -17,6 +17,10 @@ LIVE_MODELS = {
     "pro": os.getenv("LIVE_PRO_MODEL", "gemini-3.8-live-extended-thinking"),
 }
 
+# Pro (extended thinking) मॉडल को सोचने का स्तर बताना ज़रूरी है: low, medium या high
+# low = सबसे तेज़ जवाब, high = सबसे गहरी सोच (पर देर से जवाब)
+PRO_THINKING_LEVEL = os.getenv("PRO_THINKING_LEVEL", "low")
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 100ms की शांत आवाज़: चुप रहने पर सेशन ज़िंदा रखने के लिए
@@ -41,12 +45,17 @@ PROMPTS = {
 }
 
 
-def build_config(handle, extras, prompt):
-    """extras=True: सेशन रिज़ंप्शन + कॉन्टेक्स्ट कम्प्रेशन (लंबी बात और हिस्ट्री के लिए)।"""
+def build_config(handle, extras, prompt, thinking=False):
+    """extras=True: सेशन रिज़ंप्शन + कॉन्टेक्स्ट कम्प्रेशन (लंबी बात और हिस्ट्री के लिए)।
+    thinking=True: सिर्फ़ Pro मॉडल के लिए, सोचने का स्तर जोड़ता है।"""
     kwargs = dict(
         response_modalities=["AUDIO"],
         system_instruction=prompt,
     )
+    if thinking:
+        kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_level=PRO_THINKING_LEVEL
+        )
     if extras:
         kwargs["session_resumption"] = types.SessionResumptionConfig(handle=handle)
         kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
@@ -173,7 +182,10 @@ async def live_websocket_endpoint(websocket: WebSocket):
             try:
                 async with client.aio.live.connect(
                     model=model_name,
-                    config=build_config(state["handle"], state["extras"], prompt),
+                    config=build_config(
+                        state["handle"], state["extras"], prompt,
+                        thinking=(mode == "pro"),
+                    ),
                 ) as session:
                     logger.info(
                         f"Connected to Gemini Live API session ({mode})"
