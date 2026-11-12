@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
@@ -15,6 +16,8 @@ PRIMARY_LIVE_MODEL = os.getenv(
 )
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+SILENCE = bytes(3200)  # 100ms की शांत आवाज़
 
 
 @app.get("/")
@@ -32,6 +35,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
         system_instruction="आप सहायक AI हैं। हिंदी में जवाब दें, छोटे और सीधे, ज़्यादा से ज़्यादा 1-2 वाक्य।",
     )
 
+    last_audio = {"t": time.time()}
+
     try:
         async with client.aio.live.connect(
             model=PRIMARY_LIVE_MODEL, config=config
@@ -42,6 +47,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 try:
                     while True:
                         data = await websocket.receive_bytes()
+                        last_audio["t"] = time.time()
                         await session.send_realtime_input(
                             audio=types.Blob(
                                 data=data, mime_type="audio/pcm;rate=16000"
@@ -51,6 +57,19 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     logger.info("Client disconnected from WebSocket")
                 except Exception as e:
                     logger.error(f"Error receiving from client: {e}")
+
+            async def keepalive():
+                try:
+                    while True:
+                        await asyncio.sleep(2)
+                        if time.time() - last_audio["t"] > 3:
+                            await session.send_realtime_input(
+                                audio=types.Blob(
+                                    data=SILENCE, mime_type="audio/pcm;rate=16000"
+                                )
+                            )
+                except Exception as e:
+                    logger.error(f"Keepalive error: {e}")
 
             async def receive_from_gemini():
                 try:
@@ -72,6 +91,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
             tasks = [
                 asyncio.create_task(receive_from_client()),
                 asyncio.create_task(receive_from_gemini()),
+                asyncio.create_task(keepalive()),
             ]
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in tasks:
