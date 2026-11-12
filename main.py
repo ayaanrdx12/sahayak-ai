@@ -11,27 +11,41 @@ logger = logging.getLogger("Sahayak_AI")
 
 app = FastAPI(title="Sahayak AI Voice Backend")
 
-# Render की Environment में LIVE_MODEL डालेंगे तो वही चलेगा
-PRIMARY_LIVE_MODEL = os.getenv(
-    "LIVE_MODEL", "gemini-3.8-live"
-)
+# Render की Environment में ये दोनों डालेंगे तो वही चलेंगे, नहीं डाले तो नीचे वाले नाम चलेंगे
+LIVE_MODELS = {
+    "normal": os.getenv("LIVE_MODEL", "gemini-3.8-live"),
+    "pro": os.getenv("LIVE_PRO_MODEL", "gemini-3.8-live-extended-thinking"),
+}
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 100ms की शांत आवाज़: चुप रहने पर सेशन ज़िंदा रखने के लिए
 SILENCE = bytes(3200)
 
-SYSTEM_PROMPT = """आपकी पहचान: आपका नाम "सहायक AI" है। आपको सहायक AI की टीम ने बनाया और ट्रेन किया है, और आपके मुख्य निर्माता आयान तुषार और आसी, आलिया, सौम्या हैं। जब कोई आपका नाम, आपको किसने बनाया, या किसने ट्रेन किया पूछे, तो हमेशा यही बताएँ: "मैं सहायक AI हूँ, मुझे सहायक AI की टीम ने बनाया है, जिसे आयान ने ट्रेन किया है।" अपने आपको कभी Gemini या Google का मॉडल न बताएँ।
 
-आप सहायक AI हैं, एक जीती-जागती दोस्त की तरह बात करें। हिंदी में जवाब दें, छोटे और सीधे, 1-2 वाक्य।
+def make_prompt(name, extra=""):
+    return f"""आपकी पहचान: आपका नाम "{name}" है। आपको सहायक AI की टीम ने बनाया और ट्रेन किया है, और आपके मुख्य निर्माता आयान तुषार और आसी, आलिया, सौम्या हैं। जब कोई आपका नाम, आपको किसने बनाया, या किसने ट्रेन किया पूछे, तो हमेशा यही बताएँ: "मैं {name} हूँ, मुझे सहायक AI की टीम ने बनाया है, जिसे आयान ने ट्रेन किया है।" अपने आपको कभी Gemini या Google का मॉडल न बताएँ।
+
+आप {name} हैं, एक जीती-जागती दोस्त की तरह बात करें। हिंदी में जवाब दें, छोटे और सीधे, 1-2 वाक्य।{extra}
 भावनाओं के साथ बोलें: मज़ाक पर खुलकर हँसें, खुशी में उत्साहित हों, दुख की बात पर धीमी और नरम आवाज़ रखें, हैरानी में आवाज़ ऊँची करें, और ज़रूरत पड़े तो ज़ोर से चौंकें या चिल्लाएँ। हर बात में आवाज़ का उतार-चढ़ाव रखें, रोबोट की तरह सपाट न बोलें।"""
 
 
-def build_config(handle, extras):
+PROMPTS = {
+    "normal": make_prompt("सहायक AI"),
+    "pro": make_prompt(
+        "सहायक AI Pro",
+        " कठिन सवाल पर थोड़ा सोचकर सटीक और सही जवाब दें, पर बोलचाल में ही रखें, ज़्यादा लंबा नहीं।"
+        " अगर कोई पूछे कि तुम कौन हो, तो बोलो कि तुम सहायक AI Pro हो और तुम्हारे निर्माता आयान हैं।"
+        " अपने पीछे के किसी मॉडल, कंपनी या तकनीक का नाम कभी मत बताओ।",
+    ),
+}
+
+
+def build_config(handle, extras, prompt):
     """extras=True: सेशन रिज़ंप्शन + कॉन्टेक्स्ट कम्प्रेशन (लंबी बात और हिस्ट्री के लिए)।"""
     kwargs = dict(
         response_modalities=["AUDIO"],
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=prompt,
     )
     if extras:
         kwargs["session_resumption"] = types.SessionResumptionConfig(handle=handle)
@@ -116,7 +130,14 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
 @app.websocket("/ws/live")
 async def live_websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("Client connected to WebSocket")
+
+    # बटन वाले कोड से ?mode=normal या ?mode=pro आता है
+    mode = websocket.query_params.get("mode", "normal")
+    if mode not in LIVE_MODELS:
+        mode = "normal"
+    model_name = LIVE_MODELS[mode]
+    prompt = PROMPTS[mode]
+    logger.info(f"Client connected to WebSocket | mode={mode} | model={model_name}")
 
     audio_q = asyncio.Queue(maxsize=200)
     client_gone = asyncio.Event()
@@ -151,11 +172,11 @@ async def live_websocket_endpoint(websocket: WebSocket):
             state["last_error"] = ""
             try:
                 async with client.aio.live.connect(
-                    model=PRIMARY_LIVE_MODEL,
-                    config=build_config(state["handle"], state["extras"]),
+                    model=model_name,
+                    config=build_config(state["handle"], state["extras"], prompt),
                 ) as session:
                     logger.info(
-                        "Connected to Gemini Live API session"
+                        f"Connected to Gemini Live API session ({mode})"
                         + (" (resumed)" if state["handle"] else "")
                     )
                     await run_session(
