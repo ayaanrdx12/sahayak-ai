@@ -17,7 +17,7 @@ LIVE_MODELS = {
     "pro": os.getenv("LIVE_PRO_MODEL", "gemini-3.8-live-extended-thinking"),
 }
 
-# Pro (extended thinking) मॉडल को सोचने का स्तर बताना ज़रूरी है: low, medium या high
+# Pro (extended thinking) मॉडल को सोचने का स्तर: low, medium या high
 # low = सबसे तेज़ जवाब, high = सबसे गहरी सोच (पर देर से जवाब)
 PRO_THINKING_LEVEL = os.getenv("PRO_THINKING_LEVEL", "low")
 
@@ -25,6 +25,24 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 100ms की शांत आवाज़: चुप रहने पर सेशन ज़िंदा रखने के लिए
 SILENCE = bytes(3200)
+
+
+def make_thinking_config():
+    """Pro के लिए सोचने का स्तर बनाता है। पुराने google-genai में यह फ़ील्ड नहीं होता,
+    तब None लौटाता है और Pro बिना स्तर बताए चलता है।"""
+    for level in (PRO_THINKING_LEVEL.lower(), PRO_THINKING_LEVEL.upper()):
+        try:
+            return types.ThinkingConfig(thinking_level=level)
+        except Exception:
+            continue
+    logger.warning(
+        "thinking_level नहीं चला: google-genai पुराना लगता है। "
+        "requirements.txt में google-genai को नया करें, फिर दोबारा डिप्लॉय करें।"
+    )
+    return None
+
+
+PRO_THINKING_CONFIG = make_thinking_config()
 
 
 def make_prompt(name, extra=""):
@@ -52,10 +70,8 @@ def build_config(handle, extras, prompt, thinking=False):
         response_modalities=["AUDIO"],
         system_instruction=prompt,
     )
-    if thinking:
-        kwargs["thinking_config"] = types.ThinkingConfig(
-            thinking_level=PRO_THINKING_LEVEL
-        )
+    if thinking and PRO_THINKING_CONFIG is not None:
+        kwargs["thinking_config"] = PRO_THINKING_CONFIG
     if extras:
         kwargs["session_resumption"] = types.SessionResumptionConfig(handle=handle)
         kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
@@ -146,6 +162,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
         mode = "normal"
     model_name = LIVE_MODELS[mode]
     prompt = PROMPTS[mode]
+    use_thinking = (mode == "pro")
     logger.info(f"Client connected to WebSocket | mode={mode} | model={model_name}")
 
     audio_q = asyncio.Queue(maxsize=200)
@@ -174,6 +191,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
     reader = asyncio.create_task(read_client())
     quick_failures = 0
     quota_hits = 0
+    pro_failures = 0
 
     try:
         while not client_gone.is_set():
@@ -184,11 +202,11 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     model=model_name,
                     config=build_config(
                         state["handle"], state["extras"], prompt,
-                        thinking=(mode == "pro"),
+                        thinking=use_thinking,
                     ),
                 ) as session:
                     logger.info(
-                        f"Connected to Gemini Live API session ({mode})"
+                        f"Connected to Gemini Live API session ({mode} | {model_name})"
                         + (" (resumed)" if state["handle"] else "")
                     )
                     await run_session(
@@ -196,10 +214,41 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     )
             except Exception as e:
                 state["last_error"] = str(e)
-                logger.error(f"Gemini Live session error: {e}")
+                logger.error(f"Gemini Live session error ({model_name}): {e}")
 
             if client_gone.is_set():
                 break
+
+            # अगर सेशन ठीक-ठाक देर चला था, तो पुरानी गिनती मिटा दो
+            if time.time() - started > 20:
+                quota_hits = 0
+                quick_failures = 0
+                pro_failures = 0
+
+            # Pro (extended thinking) बार-बार झटपट फेल हो तो बातचीत रुकने न दो,
+            # इसी बातचीत में सामान्य Gemini 3.8 Live पर चले जाओ (नाम और अंदाज़ वही रहेगा)
+            if use_thinking and state["last_error"] and (time.time() - started < 10):
+                pro_failures += 1
+                if pro_failures >= 2:
+                    logger.warning(
+                        f"Pro मॉडल ({model_name}) नहीं चल पाया, "
+                        f"सामान्य मॉडल ({LIVE_MODELS['normal']}) पर चल रहे हैं। "
+                        f"आख़िरी एरर: {state['last_error'][:300]}"
+                    )
+                    model_name = LIVE_MODELS["normal"]
+                    use_thinking = False
+                    state["handle"] = None
+                    state["extras"] = True
+                    quota_hits = 0
+                    quick_failures = 0
+                    pro_failures = 0
+                    while not audio_q.empty():
+                        try:
+                            audio_q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    await asyncio.sleep(0.3)
+                    continue
 
             err = state["last_error"].lower()
             is_quota = ("1011" in err) or ("quota" in err) or ("429" in err)
