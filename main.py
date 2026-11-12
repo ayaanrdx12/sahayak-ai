@@ -13,7 +13,7 @@ app = FastAPI(title="Sahayak AI Voice Backend")
 
 # Render की Environment में LIVE_MODEL डालेंगे तो वही चलेगा
 PRIMARY_LIVE_MODEL = os.getenv(
-    "LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"
+    "LIVE_MODEL", "gemini-3.8-live"
 )
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -106,6 +106,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                 except asyncio.CancelledError:
                     exc = None
                 if exc:
+                    state["last_error"] = str(exc)
                     logger.error(f"Gemini कनेक्शन टूटा: {exc}")
     finally:
         for t in tasks + [gone]:
@@ -120,7 +121,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
     audio_q = asyncio.Queue(maxsize=200)
     client_gone = asyncio.Event()
     last_audio = {"t": time.time()}
-    state = {"handle": None, "extras": True}
+    state = {"handle": None, "extras": True, "last_error": ""}
 
     async def read_client():
         try:
@@ -142,10 +143,12 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
     reader = asyncio.create_task(read_client())
     quick_failures = 0
+    quota_hits = 0
 
     try:
         while not client_gone.is_set():
             started = time.time()
+            state["last_error"] = ""
             try:
                 async with client.aio.live.connect(
                     model=PRIMARY_LIVE_MODEL,
@@ -159,24 +162,39 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         session, websocket, audio_q, last_audio, state, client_gone
                     )
             except Exception as e:
+                state["last_error"] = str(e)
                 logger.error(f"Gemini Live session error: {e}")
 
             if client_gone.is_set():
                 break
 
-            # अगर कनेक्शन 4 सेकंड से पहले ही टूट गया, तो सेटिंग में दिक्कत हो सकती है
-            if time.time() - started < 4:
-                if state["extras"]:
-                    logger.warning("रिज़ंप्शन के बिना दोबारा कोशिश कर रहे हैं")
-                    state["extras"] = False
-                    state["handle"] = None
-                else:
-                    quick_failures += 1
-                    if quick_failures >= 3:
-                        logger.error("बार-बार कनेक्शन नहीं बन पाया, रुक रहे हैं")
-                        break
+            err = state["last_error"].lower()
+            is_quota = ("1011" in err) or ("quota" in err) or ("429" in err)
+
+            if is_quota:
+                # कोटा खत्म: तुरंत बार-बार जुड़ने से कोटा और जल्दी खर्च होता है, इसलिए रुककर कोशिश करो
+                quota_hits += 1
+                if quota_hits > 6:
+                    logger.error("Gemini का कोटा खत्म है, रुक रहे हैं (AI Studio में कोटा/बिलिंग जाँचें)")
+                    break
+                wait = min(3 * quota_hits, 15)
+                logger.warning(f"कोटा सीमा: {wait} सेकंड रुककर दोबारा जुड़ेंगे")
+                await asyncio.sleep(wait)
             else:
-                quick_failures = 0
+                quota_hits = 0
+                # अगर कनेक्शन 4 सेकंड से पहले ही टूट गया, तो सेटिंग में दिक्कत हो सकती है
+                if time.time() - started < 4:
+                    if state["extras"]:
+                        logger.warning("रिज़ंप्शन के बिना दोबारा कोशिश कर रहे हैं")
+                        state["extras"] = False
+                        state["handle"] = None
+                    else:
+                        quick_failures += 1
+                        if quick_failures >= 3:
+                            logger.error("बार-बार कनेक्शन नहीं बन पाया, रुक रहे हैं")
+                            break
+                else:
+                    quick_failures = 0
 
             # पुरानी बची आवाज़ हटाओ और नया सेशन जोड़ो
             while not audio_q.empty():
