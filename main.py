@@ -17,7 +17,11 @@ PRIMARY_LIVE_MODEL = os.getenv(
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-SILENCE = bytes(3200)  # 100ms की शांत आवाज़
+# 100ms की शांत आवाज़, चुप रहने पर सेशन ज़िंदा रखने के लिए
+SILENCE = bytes(3200)
+
+SYSTEM_PROMPT = """आप सहायक AI हैं, एक जीती-जागती दोस्त की तरह बात करें। हिंदी में जवाब दें, छोटे और सीधे, 1-2 वाक्य।
+भावनाओं के साथ बोलें: मज़ाक पर खुलकर हँसें, खुशी में उत्साहित हों, दुख की बात पर धीमी और नरम आवाज़ रखें, हैरानी में आवाज़ ऊँची करें, और ज़रूरत पड़े तो ज़ोर से चौंकें या चिल्लाएँ। हर बात में आवाज़ का उतार-चढ़ाव रखें, रोबोट की तरह सपाट न बोलें।"""
 
 
 @app.get("/")
@@ -32,7 +36,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction="आप सहायक AI हैं। हिंदी में जवाब दें, छोटे और सीधे, ज़्यादा से ज़्यादा 1-2 वाक्य।",
+        system_instruction=SYSTEM_PROMPT,
     )
 
     last_audio = {"t": time.time()}
