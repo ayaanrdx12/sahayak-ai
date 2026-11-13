@@ -65,6 +65,34 @@ def make_thinking_config():
 PRO_THINKING_CONFIG = make_thinking_config()
 
 
+def make_noise_config():
+    """[नया] शोर कम पकड़ने के लिए: आसपास की आवाज़ पर बोलना शुरू न करे।
+    Render में VAD_START_SENSITIVITY = LOW (कम) या HIGH (ज़्यादा) रख सकते हैं।
+    SDK में यह सुविधा न मिले तो चुपचाप बंद रहेगी, बाकी सब पहले जैसा चलेगा।"""
+    level = os.getenv("VAD_START_SENSITIVITY", "LOW").upper()
+
+    try:
+        sensitivity = getattr(
+            types.StartSensitivity,
+            f"START_SENSITIVITY_{level}"
+        )
+
+        return types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=sensitivity
+            )
+        )
+
+    except Exception:
+        logger.warning(
+            "शोर वाली सेटिंग नहीं लग पाई: google-genai SDK अपडेट करें।"
+        )
+        return None
+
+
+NOISE_CONFIG = make_noise_config()
+
+
 def make_prompt(name, extra=""):
     return f"""आपकी पहचान: आपका नाम "{name}" है। आपको सहायक AI की टीम ने बनाया और ट्रेन किया है, और आपके मुख्य निर्माता आयान तुषार और आसी, आलिया, सौम्या हैं। जब कोई आपका नाम, आपको किसने बनाया, या किसने ट्रेन किया पूछे, तो हमेशा यही बताएँ: "मैं {name} हूँ, मुझे सहायक AI की टीम ने बनाया है, जिसे आयान ने ट्रेन किया है।" अपने आपको कभी Gemini या Google का मॉडल न बताएँ।
 
@@ -99,6 +127,10 @@ def build_config(handle, extras, prompt, thinking=False, search=False):
         response_modalities=["AUDIO"],
         system_instruction=prompt,
     )
+
+    # [नया] शोर कम पकड़ने की सेटिंग (दोनों मोड में)
+    if NOISE_CONFIG is not None:
+        kwargs["realtime_input_config"] = NOISE_CONFIG
 
     # सोचने का स्तर सिर्फ़ Extended Thinking मॉडल पर चलता है, सामान्य मॉडल पर नहीं
     if thinking and PRO_THINKING_CONFIG is not None:
