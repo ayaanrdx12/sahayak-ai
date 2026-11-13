@@ -20,6 +20,10 @@ LIVE_MODELS = {
 # Pro Thinking Level
 PRO_THINKING_LEVEL = os.getenv("PRO_THINKING_LEVEL", "low")
 
+# Extended Thinking का कोटा न मिले तो इतने सेकंड तक Pro सीधे सामान्य मॉडल (+ सर्च) पर चलेगा
+PRO_RETRY_AFTER = int(os.getenv("PRO_RETRY_AFTER", "600"))
+PRO_STATE = {"blocked_until": 0.0}
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 100ms silence audio
@@ -65,19 +69,21 @@ PROMPTS = {
 }
 
 
-def build_config(handle, extras, prompt, thinking=False):
-    """Simple Live unchanged. Google Search only for Pro."""
+def build_config(handle, extras, prompt, thinking=False, search=False):
+    """thinking=True: सिर्फ़ Extended Thinking मॉडल के लिए सोचने का स्तर।
+    search=True: Google Search टूल (सिर्फ़ Pro मोड में)।"""
 
     kwargs = dict(
         response_modalities=["AUDIO"],
         system_instruction=prompt,
     )
 
-    # केवल सहायक Pro में Thinking और Google Search
-    if thinking:
-        if PRO_THINKING_CONFIG is not None:
-            kwargs["thinking_config"] = PRO_THINKING_CONFIG
+    # सोचने का स्तर सिर्फ़ Extended Thinking मॉडल पर चलता है, सामान्य मॉडल पर नहीं
+    if thinking and PRO_THINKING_CONFIG is not None:
+        kwargs["thinking_config"] = PRO_THINKING_CONFIG
 
+    # Google Search सिर्फ़ Pro मोड में (सामान्य मॉडल पर गिरने के बाद भी चालू रहता है)
+    if search:
         kwargs["tools"] = [
             types.Tool(
                 google_search=types.GoogleSearch()
@@ -215,6 +221,15 @@ async def live_websocket_endpoint(websocket: WebSocket):
     model_name = LIVE_MODELS[mode]
     prompt = PROMPTS[mode]
     use_thinking = (mode == "pro")
+    use_search = (mode == "pro")
+
+    # पिछली बार Extended Thinking का कोटा नहीं मिला था, तो अभी सीधे सामान्य मॉडल (+ सर्च) पर चलो
+    if use_thinking and time.time() < PRO_STATE["blocked_until"]:
+        model_name = LIVE_MODELS["normal"]
+        use_thinking = False
+        logger.info(
+            "Pro: Extended Thinking अभी रुका है, सामान्य मॉडल + Google Search पर चल रहे हैं"
+        )
 
     logger.info(
         f"Client connected | mode={mode} | model={model_name}"
@@ -275,6 +290,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         state["extras"],
                         prompt,
                         thinking=use_thinking,
+                        search=use_search,
                     ),
                 ) as session:
 
@@ -309,7 +325,10 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 quick_failures = 0
                 pro_failures = 0
 
-            # Pro failure fallback
+            err = state["last_error"].lower()
+
+            # Extended Thinking फेल हो (कोटा वाला एरर हो तो तुरंत, वरना दो बार झटपट फेल होने पर)
+            # तो इसी बातचीत में सामान्य Gemini 3.8 Live पर जाओ। Google Search और Pro वाला नाम/अंदाज़ वही रहेगा
             if (
                 use_thinking
                 and state["last_error"]
@@ -317,14 +336,17 @@ async def live_websocket_endpoint(websocket: WebSocket):
             ):
 
                 pro_failures += 1
+                quota_like = ("quota" in err) or ("429" in err)
 
-                if pro_failures >= 2:
+                if quota_like or pro_failures >= 2:
 
                     logger.warning(
                         f"Pro मॉडल ({model_name}) नहीं चल पाया, "
-                        f"सामान्य मॉडल पर जा रहे हैं। "
+                        f"सामान्य मॉडल + Google Search पर जा रहे हैं। "
                         f"आख़िरी एरर: {state['last_error'][:300]}"
                     )
+
+                    PRO_STATE["blocked_until"] = time.time() + PRO_RETRY_AFTER
 
                     model_name = LIVE_MODELS["normal"]
                     use_thinking = False
@@ -344,8 +366,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                     await asyncio.sleep(0.3)
                     continue
-
-            err = state["last_error"].lower()
 
             is_quota = (
                 ("1011" in err)
