@@ -17,12 +17,20 @@ LIVE_MODELS = {
     "pro": os.getenv("LIVE_PRO_MODEL", "gemini-3.8-live-extended-thinking"),
 }
 
-# Pro Thinking Level
+# Pro Thinking Level (Render में PRO_THINKING_LEVEL = low रखें)
 PRO_THINKING_LEVEL = os.getenv("PRO_THINKING_LEVEL", "low")
 
-# Extended Thinking का कोटा न मिले तो इतने सेकंड तक Pro सीधे सामान्य मॉडल (+ सर्च) पर चलेगा
-PRO_RETRY_AFTER = int(os.getenv("PRO_RETRY_AFTER", "600"))
+# [बदलाव] Extended Thinking का कोटा न मिले तो इतने सेकंड तक Pro सीधे सामान्य मॉडल (+ सर्च) पर चलेगा
+# पहले 600 था, अब 120 (2 मिनट) ताकि Pro जल्दी वापस आज़माए
+PRO_RETRY_AFTER = int(os.getenv("PRO_RETRY_AFTER", "120"))
 PRO_STATE = {"blocked_until": 0.0}
+
+# [बदलाव] keepalive की सेटिंग: (कितने सेकंड में जाँचना, कितनी चुप्पी के बाद चुप्पी-ऑडियो भेजना)
+# normal मोड पहले जैसा ही है (2, 3). सिर्फ़ Pro में कम भेजेंगे (10, 15)
+KEEPALIVE = {
+    "normal": (2, 3),
+    "pro": (10, 15),
+}
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -63,7 +71,10 @@ PROMPTS = {
         " अगर कोई पूछे कि तुम कौन हो, तो बोलो कि तुम सहायक AI Pro हो और तुम्हारे निर्माता आयान हैं।"
         " अपने पीछे के किसी मॉडल, कंपनी या तकनीक का नाम कभी मत बताओ।"
         " तुम्हारे पास Google Search का टूल है और तुम्हें इंटरनेट से ताज़ा जानकारी मिल सकती है।"
-        " जब भी कोई आज, अभी, ताज़ा या हाल की चीज़ पूछे, जैसे खबर, कौन किस पद पर है, कीमत, स्कोर, मौसम या मीम, तो अपनी याददाश्त पर भरोसा मत करो, पहले सर्च करो, फिर सर्च के नतीजे के आधार पर छोटा सीधा जवाब दो।"
+        " जब कोई आज, अभी, ताज़ा या हाल की चीज़ पूछे, जैसे खबर, कौन किस पद पर है, कीमत, स्कोर, मौसम या मीम, तो अपनी याददाश्त पर भरोसा मत करो, पहले सर्च करो, फिर सर्च के नतीजे के आधार पर छोटा सीधा जवाब दो।"
+        # [बदलाव] सर्च कम करने के लिए: सिर्फ़ ज़रूरत पर, और एक सवाल पर एक ही बार
+        " पर आम ज्ञान, गणित, बातचीत, मज़ाक या सलाह के सवाल पर सर्च बिल्कुल मत करो, सीधे जवाब दो।"
+        " एक सवाल पर ज़्यादा से ज़्यादा एक ही बार सर्च करो, बार-बार नहीं।"
         " कभी 'सिस्टम एरर' मत बोलो। अगर कुछ न कर सको तो छोटे में सीधा बताओ।",
     ),
 }
@@ -113,7 +124,8 @@ async def root():
     }
 
 
-async def run_session(session, websocket, audio_q, last_audio, state, client_gone):
+async def run_session(session, websocket, audio_q, last_audio, state, client_gone,
+                      ka_every=2, ka_idle=3):
     """Gemini connection manager."""
 
     async def send_audio():
@@ -129,15 +141,17 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
 
     async def keepalive():
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(ka_every)
 
-            if time.time() - last_audio["t"] > 3:
+            if time.time() - last_audio["t"] > ka_idle:
                 await session.send_realtime_input(
                     audio=types.Blob(
                         data=SILENCE,
                         mime_type="audio/pcm;rate=16000"
                     )
                 )
+                # [बदलाव] चुप्पी भेजने के बाद टाइमर रीसेट, ताकि हर चक्कर में न भेजे
+                last_audio["t"] = time.time()
 
     async def receive_from_gemini():
         while True:
@@ -223,6 +237,9 @@ async def live_websocket_endpoint(websocket: WebSocket):
     use_thinking = (mode == "pro")
     use_search = (mode == "pro")
 
+    # [बदलाव] इस मोड के हिसाब से keepalive की सेटिंग (normal वही 2/3, pro 10/15)
+    ka_every, ka_idle = KEEPALIVE[mode]
+
     # पिछली बार Extended Thinking का कोटा नहीं मिला था, तो अभी सीधे सामान्य मॉडल (+ सर्च) पर चलो
     if use_thinking and time.time() < PRO_STATE["blocked_until"]:
         model_name = LIVE_MODELS["normal"]
@@ -306,7 +323,9 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         audio_q,
                         last_audio,
                         state,
-                        client_gone
+                        client_gone,
+                        ka_every,
+                        ka_idle,
                     )
 
             except Exception as e:
@@ -377,13 +396,20 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                 quota_hits += 1
 
-                if quota_hits > 6:
+                # [बदलाव] Pro मोड में कोटा एरर पर कम बार कोशिश (4), normal में पहले जैसा (6)
+                max_hits = 4 if mode == "pro" else 6
+
+                if quota_hits > max_hits:
                     logger.error(
                         "Gemini का कोटा खत्म है, रुक रहे हैं।"
                     )
                     break
 
-                wait = min(3 * quota_hits, 15)
+                # [बदलाव] Pro में इंतज़ार थोड़ा ज़्यादा (5 सेकंड के कदम, अधिकतम 20)
+                if mode == "pro":
+                    wait = min(5 * quota_hits, 20)
+                else:
+                    wait = min(3 * quota_hits, 15)
 
                 logger.warning(
                     f"कोटा सीमा: {wait} सेकंड रुककर दोबारा जुड़ेंगे"
