@@ -20,16 +20,26 @@ LIVE_MODELS = {
 # Pro Thinking Level (Render में PRO_THINKING_LEVEL = low रखें)
 PRO_THINKING_LEVEL = os.getenv("PRO_THINKING_LEVEL", "low")
 
-# [बदलाव] Extended Thinking का कोटा न मिले तो इतने सेकंड तक Pro सीधे सामान्य मॉडल (+ सर्च) पर चलेगा
-# पहले 600 था, अब 120 (2 मिनट) ताकि Pro जल्दी वापस आज़माए
+# Extended Thinking का कोटा न मिले तो इतने सेकंड तक Pro सीधे सामान्य मॉडल (+ सर्च) पर चलेगा
 PRO_RETRY_AFTER = int(os.getenv("PRO_RETRY_AFTER", "120"))
 PRO_STATE = {"blocked_until": 0.0}
 
-# [बदलाव] keepalive की सेटिंग: (कितने सेकंड में जाँचना, कितनी चुप्पी के बाद चुप्पी-ऑडियो भेजना)
-# normal मोड पहले जैसा ही है (2, 3). सिर्फ़ Pro में कम भेजेंगे (10, 15)
+# [नया] सामान्य मॉडल + सर्च पर भी कोटा एरर आए, तो इतने सेकंड तक Pro बिना सर्च के बोलेगा
+# इसके बाद Pro फिर से सर्च के साथ कोशिश करेगा, यानी सर्च हमेशा के लिए बंद नहीं होता
+SEARCH_RETRY_AFTER = int(os.getenv("SEARCH_RETRY_AFTER", "120"))
+SEARCH_STATE = {"blocked_until": 0.0}
+
+# [नया] Pro में दो Gemini कनेक्शन कोशिशों के बीच कम से कम इतने सेकंड का फ़र्क (RPM कम रखने के लिए)
+# normal मोड पर इसका कोई असर नहीं है
+PRO_CONNECT_GAP = float(os.getenv("PRO_CONNECT_GAP", "2.5"))
+CONNECT_LOCK = asyncio.Lock()
+CONNECT_LAST = {"pro": 0.0}
+
+# keepalive की सेटिंग: (कितने सेकंड में जाँचना, कितनी चुप्पी के बाद चुप्पी-ऑडियो भेजना, भेजने के बाद टाइमर रीसेट)
+# normal मोड बिल्कुल पहले जैसा है (2, 3). सिर्फ़ Pro में कम भेजेंगे (10, 15)
 KEEPALIVE = {
-    "normal": (2, 3),
-    "pro": (10, 15),
+    "normal": (2, 3, False),
+    "pro": (10, 15, True),
 }
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -72,7 +82,6 @@ PROMPTS = {
         " अपने पीछे के किसी मॉडल, कंपनी या तकनीक का नाम कभी मत बताओ।"
         " तुम्हारे पास Google Search का टूल है और तुम्हें इंटरनेट से ताज़ा जानकारी मिल सकती है।"
         " जब कोई आज, अभी, ताज़ा या हाल की चीज़ पूछे, जैसे खबर, कौन किस पद पर है, कीमत, स्कोर, मौसम या मीम, तो अपनी याददाश्त पर भरोसा मत करो, पहले सर्च करो, फिर सर्च के नतीजे के आधार पर छोटा सीधा जवाब दो।"
-        # [बदलाव] सर्च कम करने के लिए: सिर्फ़ ज़रूरत पर, और एक सवाल पर एक ही बार
         " पर आम ज्ञान, गणित, बातचीत, मज़ाक या सलाह के सवाल पर सर्च बिल्कुल मत करो, सीधे जवाब दो।"
         " एक सवाल पर ज़्यादा से ज़्यादा एक ही बार सर्च करो, बार-बार नहीं।"
         " कभी 'सिस्टम एरर' मत बोलो। अगर कुछ न कर सको तो छोटे में सीधा बताओ।",
@@ -93,7 +102,7 @@ def build_config(handle, extras, prompt, thinking=False, search=False):
     if thinking and PRO_THINKING_CONFIG is not None:
         kwargs["thinking_config"] = PRO_THINKING_CONFIG
 
-    # Google Search सिर्फ़ Pro मोड में (सामान्य मॉडल पर गिरने के बाद भी चालू रहता है)
+    # Google Search सिर्फ़ Pro मोड में
     if search:
         kwargs["tools"] = [
             types.Tool(
@@ -116,6 +125,29 @@ def build_config(handle, extras, prompt, thinking=False, search=False):
     return types.LiveConnectConfig(**kwargs)
 
 
+async def throttle_pro_connect():
+    """[नया] Pro की कनेक्शन कोशिशों के बीच गैप रखता है, ताकि RPM एक साथ न भर जाए।"""
+    if PRO_CONNECT_GAP <= 0:
+        return
+
+    async with CONNECT_LOCK:
+        wait = CONNECT_LAST["pro"] + PRO_CONNECT_GAP - time.time()
+
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+        CONNECT_LAST["pro"] = time.time()
+
+
+async def sleep_unless_gone(client_gone, seconds):
+    """[नया] इंतज़ार करता है, पर क्लाइंट चला जाए तो तुरंत रुक जाता है।
+    इससे पुराना लूप नए कनेक्शन के साथ मिलकर फालतू रिक्वेस्ट नहीं भेजता।"""
+    try:
+        await asyncio.wait_for(client_gone.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 @app.get("/")
 async def root():
     return {
@@ -125,7 +157,7 @@ async def root():
 
 
 async def run_session(session, websocket, audio_q, last_audio, state, client_gone,
-                      ka_every=2, ka_idle=3):
+                      ka_every=2, ka_idle=3, ka_reset=False):
     """Gemini connection manager."""
 
     async def send_audio():
@@ -150,8 +182,10 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                         mime_type="audio/pcm;rate=16000"
                     )
                 )
-                # [बदलाव] चुप्पी भेजने के बाद टाइमर रीसेट, ताकि हर चक्कर में न भेजे
-                last_audio["t"] = time.time()
+
+                # Pro में चुप्पी भेजने के बाद टाइमर रीसेट (normal में पहले जैसा, रीसेट नहीं)
+                if ka_reset:
+                    last_audio["t"] = time.time()
 
     async def receive_from_gemini():
         while True:
@@ -237,8 +271,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
     use_thinking = (mode == "pro")
     use_search = (mode == "pro")
 
-    # [बदलाव] इस मोड के हिसाब से keepalive की सेटिंग (normal वही 2/3, pro 10/15)
-    ka_every, ka_idle = KEEPALIVE[mode]
+    # इस मोड के हिसाब से keepalive की सेटिंग
+    ka_every, ka_idle, ka_reset = KEEPALIVE[mode]
 
     # पिछली बार Extended Thinking का कोटा नहीं मिला था, तो अभी सीधे सामान्य मॉडल (+ सर्च) पर चलो
     if use_thinking and time.time() < PRO_STATE["blocked_until"]:
@@ -246,6 +280,13 @@ async def live_websocket_endpoint(websocket: WebSocket):
         use_thinking = False
         logger.info(
             "Pro: Extended Thinking अभी रुका है, सामान्य मॉडल + Google Search पर चल रहे हैं"
+        )
+
+    # [नया] पिछली बार सर्च वाले मॉडल पर भी कोटा नहीं मिला था, तो अभी सर्च के बिना चलो
+    if use_search and time.time() < SEARCH_STATE["blocked_until"]:
+        use_search = False
+        logger.info(
+            "Pro: Google Search अभी रुका है, कुछ देर बिना सर्च के चल रहे हैं"
         )
 
     logger.info(
@@ -296,6 +337,13 @@ async def live_websocket_endpoint(websocket: WebSocket):
     try:
         while not client_gone.is_set():
 
+            # [नया] Pro में कनेक्शन कोशिशों के बीच गैप
+            if mode == "pro":
+                await throttle_pro_connect()
+
+                if client_gone.is_set():
+                    break
+
             started = time.time()
             state["last_error"] = ""
 
@@ -314,6 +362,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     logger.info(
                         f"Connected to Gemini Live API "
                         f"({mode} | {model_name})"
+                        + (" + search" if use_search else "")
                         + (" (resumed)" if state["handle"] else "")
                     )
 
@@ -326,6 +375,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         client_gone,
                         ka_every,
                         ka_idle,
+                        ka_reset,
                     )
 
             except Exception as e:
@@ -345,17 +395,14 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 pro_failures = 0
 
             err = state["last_error"].lower()
+            quota_like = ("quota" in err) or ("429" in err)
+            quick = (time.time() - started < 10)
 
-            # Extended Thinking फेल हो (कोटा वाला एरर हो तो तुरंत, वरना दो बार झटपट फेल होने पर)
+            # स्टेप 1: Extended Thinking फेल हो (कोटा वाला एरर हो तो तुरंत, वरना दो बार झटपट फेल होने पर)
             # तो इसी बातचीत में सामान्य Gemini 3.8 Live पर जाओ। Google Search और Pro वाला नाम/अंदाज़ वही रहेगा
-            if (
-                use_thinking
-                and state["last_error"]
-                and (time.time() - started < 10)
-            ):
+            if use_thinking and state["last_error"] and quick:
 
                 pro_failures += 1
-                quota_like = ("quota" in err) or ("429" in err)
 
                 if quota_like or pro_failures >= 2:
 
@@ -386,6 +433,43 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     await asyncio.sleep(0.3)
                     continue
 
+            # [नया] स्टेप 2: सामान्य मॉडल + सर्च पर भी जुड़ते ही कोटा एरर आए,
+            # तो कुछ देर के लिए सर्च हटाकर सिर्फ़ आवाज़ चालू करो (normal जैसा सेटअप जो चलता है)
+            # SEARCH_RETRY_AFTER के बाद अगली बातचीत में सर्च फिर से आज़माया जाएगा
+            if (
+                mode == "pro"
+                and use_search
+                and not use_thinking
+                and state["last_error"]
+                and quota_like
+                and quick
+            ):
+
+                logger.warning(
+                    f"सर्च वाला कनेक्शन भी नहीं चला, कुछ देर बिना Google Search के चल रहे हैं। "
+                    f"आख़िरी एरर: {state['last_error'][:300]}"
+                )
+
+                SEARCH_STATE["blocked_until"] = time.time() + SEARCH_RETRY_AFTER
+
+                use_search = False
+
+                state["handle"] = None
+                state["extras"] = True
+
+                quota_hits = 0
+                quick_failures = 0
+                pro_failures = 0
+
+                while not audio_q.empty():
+                    try:
+                        audio_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                await asyncio.sleep(0.3)
+                continue
+
             is_quota = (
                 ("1011" in err)
                 or ("quota" in err)
@@ -396,7 +480,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                 quota_hits += 1
 
-                # [बदलाव] Pro मोड में कोटा एरर पर कम बार कोशिश (4), normal में पहले जैसा (6)
+                # Pro मोड में कोटा एरर पर कम बार कोशिश (4), normal में पहले जैसा (6)
                 max_hits = 4 if mode == "pro" else 6
 
                 if quota_hits > max_hits:
@@ -405,7 +489,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     )
                     break
 
-                # [बदलाव] Pro में इंतज़ार थोड़ा ज़्यादा (5 सेकंड के कदम, अधिकतम 20)
+                # Pro में इंतज़ार थोड़ा ज़्यादा (5 सेकंड के कदम, अधिकतम 20)
                 if mode == "pro":
                     wait = min(5 * quota_hits, 20)
                 else:
@@ -415,7 +499,11 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     f"कोटा सीमा: {wait} सेकंड रुककर दोबारा जुड़ेंगे"
                 )
 
-                await asyncio.sleep(wait)
+                # [नया] इंतज़ार के बीच क्लाइंट चला जाए तो तुरंत रुको
+                await sleep_unless_gone(client_gone, wait)
+
+                if client_gone.is_set():
+                    break
 
             else:
 
