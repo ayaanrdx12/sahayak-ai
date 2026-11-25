@@ -2,7 +2,6 @@ import asyncio
 import os
 import time
 import logging
-import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
@@ -13,74 +12,18 @@ logger = logging.getLogger("Sahayak_AI")
 app = FastAPI(title="Sahayak AI Voice Backend")
 
 # ======================================================================
-# [बदलाव 2] normal और pro, दोनों में एक ही Gemini 3.8 Live मॉडल (LIVE_MODEL)
-# Extended Thinking पूरी तरह हटा दिया गया है
+# सिर्फ़ एक मॉडल: Gemini Live (Render में LIVE_MODEL में जो लिखा है वही चलेगा)
+# Pro मोड, ElevenLabs और Google Search पूरी तरह हटा दिए गए हैं
 # ======================================================================
 LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.8-live").strip()
 
-LIVE_MODELS = {
-    "normal": LIVE_MODEL,
-    "pro": LIVE_MODEL,
-}
+# keepalive: हर 2 सेकंड में जाँचो, 3 सेकंड चुप्पी हो तो चुप्पी-ऑडियो भेजो
+KA_EVERY = 2
+KA_IDLE = 3
 
-# सर्च वाले कनेक्शन पर कोटा एरर आए, तो इतने सेकंड तक Pro बिना सर्च के बोलेगा
-# इसके बाद Pro फिर से सर्च के साथ कोशिश करेगा
-SEARCH_RETRY_AFTER = int(os.getenv("SEARCH_RETRY_AFTER", "120"))
-SEARCH_STATE = {"blocked_until": 0.0}
-
-# Pro में दो Gemini कनेक्शन कोशिशों के बीच कम से कम इतने सेकंड का फ़र्क (RPM कम रखने के लिए)
-PRO_CONNECT_GAP = float(os.getenv("PRO_CONNECT_GAP", "2.5"))
-CONNECT_LOCK = asyncio.Lock()
-CONNECT_LAST = {"pro": 0.0}
-
-# keepalive की सेटिंग: (कितने सेकंड में जाँचना, कितनी चुप्पी के बाद चुप्पी-ऑडियो भेजना, भेजने के बाद टाइमर रीसेट)
-KEEPALIVE = {
-    "normal": (2, 3, False),
-    "pro": (10, 15, True),
-}
-
-# ======================================================================
-# [बदलाव 1] ElevenLabs की आवाज़ (सिर्फ़ Pro मोड के लिए)
-# Render में आपकी चाबी का नाम ELEVENLABS_API_KEY है, वही अब सीधे पढ़ी जाएगी।
-# पुराना नाम ELEVEN_API_KEY भी चलता रहेगा।
-# आवाज़ की ID के लिए Render में ELEVENLABS_VOICE_ID (या ELEVEN_VOICE_ID) जोड़ सकते हैं।
-# न जोड़ें तो नीचे की पुरुष आवाज़ (Adam) अपने-आप चलेगी।
-# ======================================================================
-def _env(*names, default=""):
-    for n in names:
-        v = os.getenv(n, "").strip()
-        if v:
-            return v
-    return default
-
-
-ELEVEN_API_KEY = _env("ELEVENLABS_API_KEY", "ELEVEN_API_KEY")
-ELEVEN_VOICE_ID = _env(
-    "ELEVENLABS_VOICE_ID",
-    "ELEVEN_VOICE_ID",
-    default="pNInz6obpgDQGcFmaJgB",
-)
-
-# बोलने वाला मॉडल. यह हिंदी समेत बहुत सी भाषाएँ बोलता है
-ELEVEN_MODEL = _env("ELEVENLABS_MODEL", "ELEVEN_MODEL", default="eleven_multilingual_v2")
-
-# stability जितनी कम, उतना ज़्यादा उतार-चढ़ाव. style जितनी ज़्यादा, उतना ज़्यादा अंदाज़
-ELEVEN_STABILITY = float(os.getenv("ELEVEN_STABILITY", "0.35"))
-ELEVEN_STYLE = float(os.getenv("ELEVEN_STYLE", "0.5"))
-
-# ElevenLabs में एरर आए (जैसे क्रेडिट खत्म), तो इतने सेकंड तक Pro Gemini की आवाज़ में बोलेगा
-ELEVEN_RETRY_AFTER = int(os.getenv("ELEVEN_RETRY_AFTER", "300"))
-ELEVEN_STATE = {"blocked_until": 0.0}
-
-# 1 = यूज़र बीच में बोले तो ElevenLabs की आवाज़ रुक जाए. गड़बड़ करे तो Render में 0 कर दें
-ELEVEN_BARGE_IN = os.getenv("ELEVEN_BARGE_IN", "1") == "1"
-
-# आवाज़ 24kHz, 16-bit PCM में आती है (Gemini की आवाज़ जैसी)
-ELEVEN_BYTES_PER_SEC = 48000
-
-# बोलने के लिए वाक्य कम से कम इतने अक्षर का होने पर भेजेंगे
-MIN_CHARS = 20
-SENT_END = "।.?!\n"
+# 1 = ESP32 वाले डिवाइस में AI बीच में नहीं रुकेगा, अपना वाक्य पूरा करेगा
+# कोई गड़बड़ी करे तो Render में NO_INTERRUPT = 0 कर दें
+NO_INTERRUPT = os.getenv("NO_INTERRUPT", "1") == "1"
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -88,31 +31,35 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 SILENCE = bytes(3200)
 
 
-def make_noise_config():
+def make_realtime_config(no_interrupt):
     """शोर कम पकड़ने के लिए: आसपास की आवाज़ पर बोलना शुरू न करे।
+    no_interrupt=True हो तो AI को बीच में टोका नहीं जा सकेगा।
     Render में VAD_START_SENSITIVITY = LOW (कम) या HIGH (ज़्यादा) रख सकते हैं।"""
     level = os.getenv("VAD_START_SENSITIVITY", "LOW").upper()
+    kwargs = {}
 
     try:
-        sensitivity = getattr(
-            types.StartSensitivity,
-            f"START_SENSITIVITY_{level}"
+        sensitivity = getattr(types.StartSensitivity, f"START_SENSITIVITY_{level}")
+        kwargs["automatic_activity_detection"] = types.AutomaticActivityDetection(
+            start_of_speech_sensitivity=sensitivity
         )
-
-        return types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                start_of_speech_sensitivity=sensitivity
-            )
-        )
-
     except Exception:
-        logger.warning(
-            "शोर वाली सेटिंग नहीं लग पाई: google-genai SDK अपडेट करें।"
-        )
+        logger.warning("शोर वाली सेटिंग नहीं लग पाई: google-genai SDK अपडेट करें।")
+
+    if no_interrupt:
+        try:
+            kwargs["activity_handling"] = types.ActivityHandling.NO_INTERRUPTION
+        except Exception:
+            logger.warning("NO_INTERRUPTION सेटिंग नहीं लग पाई: google-genai SDK अपडेट करें।")
+
+    if not kwargs:
         return None
 
-
-NOISE_CONFIG = make_noise_config()
+    try:
+        return types.RealtimeInputConfig(**kwargs)
+    except Exception as e:
+        logger.warning(f"realtime सेटिंग नहीं बन पाई: {e}")
+        return None
 
 
 def make_prompt(name, extra=""):
@@ -174,367 +121,26 @@ def make_prompt(name, extra=""):
 नंबर वाले सवाल (4 से 7) में नंबर न हो तो वह खास जवाब मत दो, आम तरीके से बात करो। ये खास जवाब सिर्फ़ इन्हीं सवालों पर दो, अपनी तरफ़ से कभी नहीं।"""
 
 
-PROMPTS = {
-    "normal": make_prompt("सहायक AI"),
-
-    "pro": make_prompt(
-        "सहायक AI Pro",
-        " कठिन सवाल पर थोड़ा सोचकर सटीक और सही जवाब दें, पर बोलचाल में ही रखें, ज़्यादा लंबा नहीं।"
-        " अगर कोई पूछे कि तुम कौन हो, तो बोलो कि तुम सहायक AI Pro हो और तुम्हारे निर्माता आयान हैं।"
-        " अपने पीछे के किसी मॉडल, कंपनी या तकनीक का नाम कभी मत बताओ।"
-        " तुम्हारी आवाज़ एक महिला की है, इसलिए हमेशा स्त्रीलिंग में बोलो, जैसे 'मैं बताती हूँ', 'मैं कर सकती हूँ'।"
-        " भावना शब्दों में भी ज़ाहिर करो, जैसे 'अरे वाह!', 'हा हा हा', 'ओह...', 'क्या बात है!', ताकि आवाज़ में असली भाव आए।"
-        " तुम्हारे पास Google Search का टूल है और तुम्हें इंटरनेट से ताज़ा जानकारी मिल सकती है।"
-        " जब कोई आज, अभी, ताज़ा या हाल की चीज़ पूछे, जैसे खबर, कौन किस पद पर है, कीमत, स्कोर, मौसम या मीम, तो अपनी याददाश्त पर भरोसा मत करो, पहले सर्च करो, फिर सर्च के नतीजे के आधार पर छोटा सीधा जवाब दो।"
-        " पर आम ज्ञान, गणित, बातचीत, मज़ाक या सलाह के सवाल पर सर्च बिल्कुल मत करो, सीधे जवाब दो।"
-        " एक सवाल पर ज़्यादा से ज़्यादा एक ही बार सर्च करो, बार-बार नहीं।"
-        " कभी 'सिस्टम एरर' मत बोलो। अगर कुछ न कर सको तो छोटे में सीधा बताओ।",
-    ),
-}
+PROMPT = make_prompt("सहायक AI")
 
 
-def build_config(handle, extras, prompt, search=False, transcribe=False):
-    """search=True: Google Search टूल (सिर्फ़ Pro मोड में)।
-    transcribe=True: Gemini जो बोले उसका लिखा हुआ रूप भी मिले (ElevenLabs को बोलने के लिए)।"""
-
+def build_config(handle, extras, realtime_config):
     kwargs = dict(
         response_modalities=["AUDIO"],
-        system_instruction=prompt,
+        system_instruction=PROMPT,
     )
 
-    if NOISE_CONFIG is not None:
-        kwargs["realtime_input_config"] = NOISE_CONFIG
-
-    # Google Search सिर्फ़ Pro मोड में
-    if search:
-        kwargs["tools"] = [
-            types.Tool(
-                google_search=types.GoogleSearch()
-            )
-        ]
-
-    # ElevenLabs वाले Pro के लिए: Gemini के जवाब का टेक्स्ट चाहिए
-    if transcribe:
-        kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
-
-        if ELEVEN_BARGE_IN:
-            kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
+    if realtime_config is not None:
+        kwargs["realtime_input_config"] = realtime_config
 
     # Session Resumption and Context Compression
     if extras:
-        kwargs["session_resumption"] = (
-            types.SessionResumptionConfig(handle=handle)
-        )
-
-        kwargs["context_window_compression"] = (
-            types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow()
-            )
+        kwargs["session_resumption"] = types.SessionResumptionConfig(handle=handle)
+        kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow()
         )
 
     return types.LiveConnectConfig(**kwargs)
-
-
-# ======================================================================
-# ElevenLabs बोलने वाला हिस्सा
-# ======================================================================
-def eleven_ready():
-    """ElevenLabs अभी इस्तेमाल हो सकता है या नहीं (चाबी, आवाज़ और कोई हालिया एरर)।"""
-    return bool(
-        ELEVEN_API_KEY
-        and ELEVEN_VOICE_ID
-        and time.time() >= ELEVEN_STATE["blocked_until"]
-    )
-
-
-def last_boundary(buf):
-    """वाक्य खत्म होने की आख़िरी जगह। 3.5 जैसी दशमलव संख्या को बीच में नहीं काटता।"""
-    for i in range(len(buf) - 1, -1, -1):
-        ch = buf[i]
-
-        if ch not in SENT_END:
-            continue
-
-        if ch == ".":
-            prev_digit = i > 0 and buf[i - 1].isdigit()
-            next_digit = i + 1 < len(buf) and buf[i + 1].isdigit()
-
-            if prev_digit and (next_digit or i == len(buf) - 1):
-                continue
-
-        return i
-
-    return -1
-
-
-def take_ready(buf, force=False):
-    """बफ़र से बोलने लायक हिस्सा निकालता है। (बोलने वाला टेक्स्ट, बचा हुआ टेक्स्ट)"""
-    if force:
-        return buf.strip(), ""
-
-    cut = last_boundary(buf)
-
-    if cut >= 0 and len(buf[:cut + 1].strip()) >= MIN_CHARS:
-        return buf[:cut + 1].strip(), buf[cut + 1:]
-
-    # बहुत लंबा वाक्य बिना विराम के आए, तो किसी खाली जगह पर काट दो
-    if len(buf) > 150:
-        sp = buf.rfind(" ", 0, 150)
-
-        if sp > 0:
-            return buf[:sp].strip(), buf[sp + 1:]
-
-    return "", buf
-
-
-class ElevenSpeaker:
-    """Gemini के जवाब का टेक्स्ट लेकर ElevenLabs की आवाज़ में ऐप तक भेजता है।
-    ElevenLabs में एरर आए (जैसे क्रेडिट खत्म) तो उस जवाब में Gemini की अपनी आवाज़ चला देता है।"""
-
-    def __init__(self, websocket, client_gone):
-        self.ws = websocket
-        self.client_gone = client_gone
-
-        self.q = asyncio.Queue()
-
-        # यह संख्या बढ़ाने पर चल रही और कतार वाली पुरानी आवाज़ रुक जाती है
-        self.generation = 0
-
-        self.turn_id = 0
-        self.in_turn = False
-        self.text_buf = ""
-        self.prev_text = ""
-
-        self.turn_gemini_voice = False
-        self.turn_audio = []
-        self.sent_audio = False
-
-        self.speaking = False
-        self.play_until = 0.0
-        self.last_model_event = 0.0
-
-    def _ensure_turn(self):
-        self.last_model_event = time.time()
-
-        if self.in_turn:
-            return
-
-        self.in_turn = True
-        self.turn_id += 1
-        self.text_buf = ""
-        self.prev_text = ""
-        self.turn_audio = []
-        self.sent_audio = False
-        self.turn_gemini_voice = not eleven_ready()
-
-    async def on_gemini_audio(self, data):
-        self._ensure_turn()
-
-        if self.turn_gemini_voice:
-            await self.ws.send_bytes(data)
-        else:
-            # ElevenLabs चल रहा है, तो Gemini की आवाज़ रोककर रखो (एरर आए तभी काम आएगी)
-            self.turn_audio.append(data)
-
-    def on_text(self, text):
-        self._ensure_turn()
-
-        if self.turn_gemini_voice:
-            return
-
-        self.text_buf += text
-        self._push_ready(force=False)
-
-    def end_turn(self):
-        self.last_model_event = time.time()
-
-        if self.in_turn and not self.turn_gemini_voice:
-            self._push_ready(force=True)
-
-        self.in_turn = False
-
-    def _push_ready(self, force):
-        ready, rest = take_ready(self.text_buf, force)
-        self.text_buf = rest
-
-        if ready:
-            self.q.put_nowait((self.generation, self.turn_id, ready))
-
-    def _drain(self):
-        while not self.q.empty():
-            try:
-                self.q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-    async def interrupt(self):
-        """आवाज़ तुरंत रोको और ऐप को भी बताओ कि बजना बंद करे।"""
-        self.generation += 1
-        self._drain()
-
-        self.play_until = 0.0
-        self.text_buf = ""
-        self.turn_audio = []
-        self.in_turn = False
-
-        try:
-            await self.ws.send_text("interrupted")
-        except Exception:
-            pass
-
-    def busy(self):
-        return (
-            self.speaking
-            or (not self.q.empty())
-            or time.time() < self.play_until
-        )
-
-    async def on_user_speech(self):
-        """यूज़र पुरानी आवाज़ के बीच में बोलने लगा।"""
-        if not ELEVEN_BARGE_IN:
-            return
-
-        if self.in_turn:
-            return
-
-        if time.time() - self.last_model_event < 1.5:
-            return
-
-        if self.busy():
-            logger.info("यूज़र बीच में बोला: ElevenLabs की आवाज़ रोक रहे हैं")
-            await self.interrupt()
-
-    async def fail(self, gen, turn_id, err):
-        logger.error(f"ElevenLabs एरर: {err}")
-
-        # कुछ देर ElevenLabs बंद, Pro Gemini की आवाज़ में चलेगा
-        ELEVEN_STATE["blocked_until"] = time.time() + ELEVEN_RETRY_AFTER
-
-        if self.client_gone.is_set():
-            return
-
-        if gen != self.generation or turn_id != self.turn_id:
-            return
-
-        if self.sent_audio or self.turn_gemini_voice:
-            return
-
-        logger.warning("इस जवाब में Gemini की अपनी आवाज़ चला रहे हैं")
-
-        self.turn_gemini_voice = True
-        self.generation += 1
-        self._drain()
-
-        saved = self.turn_audio
-        self.turn_audio = []
-
-        for chunk in saved:
-            await self.ws.send_bytes(chunk)
-
-    async def speak(self, http, gen, turn_id, text):
-        body = {
-            "text": text,
-            "model_id": ELEVEN_MODEL,
-            "voice_settings": {
-                "stability": ELEVEN_STABILITY,
-                "similarity_boost": 0.8,
-                "style": ELEVEN_STYLE,
-                "use_speaker_boost": True,
-            },
-        }
-
-        if self.prev_text and "v3" not in ELEVEN_MODEL:
-            body["previous_text"] = self.prev_text[-300:]
-
-        url = (
-            "https://api.elevenlabs.io/v1/text-to-speech/"
-            f"{ELEVEN_VOICE_ID}/stream"
-        )
-
-        self.speaking = True
-
-        try:
-            async with http.stream(
-                "POST",
-                url,
-                params={"output_format": "pcm_24000"},
-                headers={
-                    "xi-api-key": ELEVEN_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            ) as r:
-
-                if r.status_code != 200:
-                    detail = (await r.aread()).decode("utf-8", "ignore")[:300]
-                    raise RuntimeError(f"HTTP {r.status_code}: {detail}")
-
-                carry = b""
-
-                async for chunk in r.aiter_bytes():
-                    if gen != self.generation:
-                        return
-
-                    carry += chunk
-
-                    # 16-bit आवाज़ है, इसलिए हमेशा जोड़ी (2 बाइट) में ही भेजो
-                    n = len(carry) - (len(carry) % 2)
-
-                    if n:
-                        out, carry = carry[:n], carry[n:]
-
-                        await self.ws.send_bytes(out)
-
-                        if turn_id == self.turn_id:
-                            self.sent_audio = True
-
-                        now = time.time()
-                        self.play_until = (
-                            max(self.play_until, now)
-                            + len(out) / ELEVEN_BYTES_PER_SEC
-                        )
-
-            if gen == self.generation:
-                self.prev_text = text
-
-        finally:
-            self.speaking = False
-
-    async def worker(self):
-        timeout = httpx.Timeout(20.0, connect=10.0)
-
-        async with httpx.AsyncClient(timeout=timeout) as http:
-            while True:
-                gen, turn_id, text = await self.q.get()
-
-                if gen != self.generation:
-                    continue
-
-                try:
-                    await self.speak(http, gen, turn_id, text)
-
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception as e:
-                    if self.client_gone.is_set():
-                        return
-
-                    await self.fail(gen, turn_id, str(e))
-
-
-async def throttle_pro_connect():
-    """Pro की कनेक्शन कोशिशों के बीच गैप रखता है, ताकि RPM एक साथ न भर जाए।"""
-    if PRO_CONNECT_GAP <= 0:
-        return
-
-    async with CONNECT_LOCK:
-        wait = CONNECT_LAST["pro"] + PRO_CONNECT_GAP - time.time()
-
-        if wait > 0:
-            await asyncio.sleep(wait)
-
-        CONNECT_LAST["pro"] = time.time()
 
 
 async def sleep_unless_gone(client_gone, seconds):
@@ -553,10 +159,8 @@ async def root():
     }
 
 
-async def run_session(session, websocket, audio_q, last_audio, state, client_gone,
-                      ka_every=2, ka_idle=3, ka_reset=False, speaker=None):
-    """Gemini connection manager.
-    speaker सिर्फ़ ElevenLabs वाले Pro में होता है। normal मोड में None रहता है।"""
+async def run_session(session, websocket, audio_q, last_audio, state, client_gone):
+    """Gemini connection manager."""
 
     async def send_audio():
         while True:
@@ -571,18 +175,15 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
 
     async def keepalive():
         while True:
-            await asyncio.sleep(ka_every)
+            await asyncio.sleep(KA_EVERY)
 
-            if time.time() - last_audio["t"] > ka_idle:
+            if time.time() - last_audio["t"] > KA_IDLE:
                 await session.send_realtime_input(
                     audio=types.Blob(
                         data=SILENCE,
                         mime_type="audio/pcm;rate=16000"
                     )
                 )
-
-                if ka_reset:
-                    last_audio["t"] = time.time()
 
     async def receive_from_gemini():
         while True:
@@ -591,11 +192,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
             async for response in session.receive():
                 got_any = True
 
-                upd = getattr(
-                    response,
-                    "session_resumption_update",
-                    None
-                )
+                upd = getattr(response, "session_resumption_update", None)
 
                 if upd and upd.resumable and upd.new_handle:
                     state["handle"] = upd.new_handle
@@ -604,24 +201,13 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                     logger.info("Gemini सेटअप पूरा हुआ")
 
                 if getattr(response, "go_away", None):
-                    logger.info(
-                        "Gemini: कनेक्शन जल्द बंद होगा, दोबारा जुड़ेंगे"
-                    )
+                    logger.info("Gemini: कनेक्शन जल्द बंद होगा, दोबारा जुड़ेंगे")
 
                 sc = response.server_content
 
                 if sc:
                     if getattr(sc, "interrupted", False):
-                        if speaker is not None:
-                            await speaker.interrupt()
-                        else:
-                            await websocket.send_text("interrupted")
-
-                    if speaker is not None:
-                        it = getattr(sc, "input_transcription", None)
-
-                        if it and getattr(it, "text", None):
-                            await speaker.on_user_speech()
+                        await websocket.send_text("interrupted")
 
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
@@ -629,23 +215,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                                 if not state.get("got_audio_logged"):
                                     logger.info("Gemini से आवाज़ आना शुरू हुई")
                                     state["got_audio_logged"] = True
-                                if speaker is None:
-                                    await websocket.send_bytes(
-                                        part.inline_data.data
-                                    )
-                                else:
-                                    await speaker.on_gemini_audio(
-                                        part.inline_data.data
-                                    )
-
-                    if speaker is not None:
-                        ot = getattr(sc, "output_transcription", None)
-
-                        if ot and getattr(ot, "text", None):
-                            speaker.on_text(ot.text)
-
-                        if getattr(sc, "turn_complete", False):
-                            speaker.end_turn()
+                                await websocket.send_bytes(part.inline_data.data)
 
             if not got_any:
                 await asyncio.sleep(0.05)
@@ -685,27 +255,14 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
-    # mode=normal or mode=pro
-    mode = websocket.query_params.get("mode", "normal")
+    # ESP32 वाला डिवाइस ?device=esp32 भेजता है। तभी AI बीच में नहीं रुकता।
+    device = websocket.query_params.get("device", "")
+    no_interrupt = NO_INTERRUPT and (device == "esp32")
 
-    if mode not in LIVE_MODELS:
-        mode = "normal"
-
-    model_name = LIVE_MODELS[mode]
-    prompt = PROMPTS[mode]
-    use_search = (mode == "pro")
-
-    ka_every, ka_idle, ka_reset = KEEPALIVE[mode]
-
-    # पिछली बार सर्च वाले कनेक्शन पर कोटा नहीं मिला था, तो अभी सर्च के बिना चलो
-    if use_search and time.time() < SEARCH_STATE["blocked_until"]:
-        use_search = False
-        logger.info(
-            "Pro: Google Search अभी रुका है, कुछ देर बिना सर्च के चल रहे हैं"
-        )
+    realtime_config = make_realtime_config(no_interrupt)
 
     logger.info(
-        f"Client connected | mode={mode} | model={model_name}"
+        f"Client connected | device={device or 'app'} | model={LIVE_MODEL} | no_interrupt={no_interrupt}"
     )
 
     audio_q = asyncio.Queue(maxsize=200)
@@ -718,20 +275,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
         "extras": True,
         "last_error": ""
     }
-
-    # Pro मोड में ElevenLabs की आवाज़ (normal मोड में कुछ नहीं बदलता)
-    speaker = None
-    speaker_task = None
-
-    if mode == "pro":
-        if ELEVEN_API_KEY and ELEVEN_VOICE_ID:
-            speaker = ElevenSpeaker(websocket, client_gone)
-            speaker_task = asyncio.create_task(speaker.worker())
-            logger.info("Pro: ElevenLabs की आवाज़ चालू है")
-        else:
-            logger.warning(
-                "Pro: ElevenLabs की चाबी (ELEVENLABS_API_KEY) नहीं मिली, Gemini की आवाज़ में चलेगा"
-            )
 
     async def read_client():
         try:
@@ -765,32 +308,22 @@ async def live_websocket_endpoint(websocket: WebSocket):
     try:
         while not client_gone.is_set():
 
-            if mode == "pro":
-                await throttle_pro_connect()
-
-                if client_gone.is_set():
-                    break
-
             started = time.time()
             state["last_error"] = ""
+            state["got_audio_logged"] = False
 
             try:
                 async with client.aio.live.connect(
-                    model=model_name,
+                    model=LIVE_MODEL,
                     config=build_config(
                         state["handle"],
                         state["extras"],
-                        prompt,
-                        search=use_search,
-                        transcribe=(speaker is not None),
+                        realtime_config,
                     ),
                 ) as session:
 
                     logger.info(
-                        f"Connected to Gemini Live API "
-                        f"({mode} | {model_name})"
-                        + (" + search" if use_search else "")
-                        + (" + ElevenLabs" if speaker is not None else "")
+                        f"Connected to Gemini Live API ({LIVE_MODEL})"
                         + (" (resumed)" if state["handle"] else "")
                     )
 
@@ -801,18 +334,11 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         last_audio,
                         state,
                         client_gone,
-                        ka_every,
-                        ka_idle,
-                        ka_reset,
-                        speaker,
                     )
 
             except Exception as e:
                 state["last_error"] = str(e)
-
-                logger.error(
-                    f"Gemini Live session error ({model_name}): {e}"
-                )
+                logger.error(f"Gemini Live session error ({LIVE_MODEL}): {e}")
 
             if client_gone.is_set():
                 break
@@ -823,70 +349,20 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 quick_failures = 0
 
             err = state["last_error"].lower()
-            quota_like = ("quota" in err) or ("429" in err)
-            quick = (time.time() - started < 10)
 
-            # सर्च वाले कनेक्शन पर जुड़ते ही कोटा एरर आए,
-            # तो कुछ देर के लिए सर्च हटाकर सिर्फ़ आवाज़ चालू करो
-            # SEARCH_RETRY_AFTER के बाद अगली बातचीत में सर्च फिर से आज़माया जाएगा
-            if (
-                mode == "pro"
-                and use_search
-                and state["last_error"]
-                and quota_like
-                and quick
-            ):
-
-                logger.warning(
-                    f"सर्च वाला कनेक्शन नहीं चला, कुछ देर बिना Google Search के चल रहे हैं। "
-                    f"आख़िरी एरर: {state['last_error'][:300]}"
-                )
-
-                SEARCH_STATE["blocked_until"] = time.time() + SEARCH_RETRY_AFTER
-
-                use_search = False
-
-                state["handle"] = None
-                state["extras"] = True
-
-                quota_hits = 0
-                quick_failures = 0
-
-                while not audio_q.empty():
-                    try:
-                        audio_q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-                await asyncio.sleep(0.3)
-                continue
-
-            is_quota = (
-                ("1011" in err)
-                or ("quota" in err)
-                or ("429" in err)
-            )
+            is_quota = ("1011" in err) or ("quota" in err) or ("429" in err)
 
             if is_quota:
 
                 quota_hits += 1
 
-                max_hits = 4 if mode == "pro" else 6
-
-                if quota_hits > max_hits:
-                    logger.error(
-                        "Gemini का कोटा खत्म है, रुक रहे हैं।"
-                    )
+                if quota_hits > 6:
+                    logger.error("Gemini का कोटा खत्म है, रुक रहे हैं।")
                     break
 
-                if mode == "pro":
-                    wait = min(5 * quota_hits, 20)
-                else:
-                    wait = min(3 * quota_hits, 15)
+                wait = min(3 * quota_hits, 15)
 
-                logger.warning(
-                    f"कोटा सीमा: {wait} सेकंड रुककर दोबारा जुड़ेंगे"
-                )
+                logger.warning(f"कोटा सीमा: {wait} सेकंड रुककर दोबारा जुड़ेंगे")
 
                 await sleep_unless_gone(client_gone, wait)
 
@@ -901,9 +377,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                     if state["extras"]:
 
-                        logger.warning(
-                            "रिज़ंप्शन के बिना दोबारा कोशिश कर रहे हैं"
-                        )
+                        logger.warning("रिज़ंप्शन के बिना दोबारा कोशिश कर रहे हैं")
 
                         state["extras"] = False
                         state["handle"] = None
@@ -913,9 +387,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         quick_failures += 1
 
                         if quick_failures >= 3:
-                            logger.error(
-                                "बार-बार कनेक्शन नहीं बन पाया, रुक रहे हैं"
-                            )
+                            logger.error("बार-बार कनेक्शन नहीं बन पाया, रुक रहे हैं")
                             break
 
                 else:
@@ -936,10 +408,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
         reader.cancel()
 
-        if speaker_task is not None:
-            speaker_task.cancel()
-
         try:
             await websocket.close()
         except Exception:
             pass
+            
