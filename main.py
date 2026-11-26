@@ -2,7 +2,6 @@ import asyncio
 import os
 import time
 import logging
-from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
@@ -29,30 +28,6 @@ NO_INTERRUPT = os.getenv("NO_INTERRUPT", "1") == "1"
 # 1 = Render के Logs में दिखेगा कि AI ने आपकी आवाज़ में क्या सुना और क्या बोला (जाँच के लिए)
 # जाँच पूरी होने पर Render में DEBUG_HEAR = 0 कर सकते हैं
 DEBUG_HEAR = os.getenv("DEBUG_HEAR", "1") == "1"
-
-# 1 = ESP32 के सर्वर से जुड़ते ही AI खुद समय के हिसाब से "गुड मॉर्निंग" जैसा अभिवादन बोलेगा
-# इससे पता चलता है कि स्पीकर/एम्पलीफायर ठीक है या नहीं। बंद करना हो तो Render में GREET_ON_CONNECT = 0
-GREET_ON_CONNECT = os.getenv("GREET_ON_CONNECT", "1") == "1"
-IST = timezone(timedelta(hours=5, minutes=30))
-LAST_GREET = {"t": 0.0}   # कनेक्शन बार-बार टूटे तो हर बार अभिवादन न बोले (20 सेकंड में एक बार)
-
-
-def greeting_word():
-    h = datetime.now(IST).hour
-    if 5 <= h < 12:
-        return "गुड मॉर्निंग"
-    if 12 <= h < 17:
-        return "गुड आफ्टरनून"
-    if 17 <= h < 21:
-        return "गुड इवनिंग"
-    return "नमस्ते"
-
-
-# ESP32 के लिए आवाज़ असली रफ़्तार के पास भेजो (1 = चालू)। इससे ESP32 की मेमोरी नहीं भरती और आवाज़ टूटती नहीं।
-# कोई गड़बड़ी करे तो Render में PACE_ESP32 = 0 कर दें
-PACE_ESP32 = os.getenv("PACE_ESP32", "1") == "1"
-LEAD_SEC = float(os.getenv("LEAD_SEC", "0.8"))   # असली समय से इतनी सेकंड की आवाज़ आगे तक भेज दो
-BYTES_PER_SEC = 48000                            # 24 kHz x 16-बिट x मोनो
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -153,7 +128,22 @@ def make_prompt(name, extra=""):
 PROMPT = make_prompt("सहायक AI")
 
 
-def build_config(handle, extras, realtime_config):
+def pick_emoji(text):
+    """AI के जवाब में मज़ाकिया या शरारती बात पकड़ता है और ESP32 की स्क्रीन के लिए इमोजी का नाम देता है।
+    सामान्य या खेती वाले जवाबों में इमोजी नहीं दिखेगा।"""
+    t = text.replace(" ", "").replace(",", "").replace("।", "").replace("!", "")
+    if "भिखमंगे" in t or "भिखमंगा" in t:
+        return "angry"
+    if "आवारा" in t or "5स्टार" in t or "डूनथिंग" in t or "हाहा" in t:
+        return "laugh"
+    if "गालीदेतीहै" in t:
+        return "surprise"
+    if "महानहै" in t:
+        return "cool"
+    return None
+
+
+def build_config(handle, extras, realtime_config, transcribe=False):
     kwargs = dict(
         response_modalities=["AUDIO"],
         system_instruction=PROMPT,
@@ -164,6 +154,9 @@ def build_config(handle, extras, realtime_config):
 
     if DEBUG_HEAR:
         kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
+
+    # AI जो बोल रहा है उसका लिखा रूप: Logs देखने और ESP32 की स्क्रीन पर इमोजी दिखाने के काम आता है
+    if DEBUG_HEAR or transcribe:
         kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
 
     # Session Resumption and Context Compression
@@ -192,7 +185,7 @@ async def root():
     }
 
 
-async def run_session(session, websocket, audio_q, last_audio, state, client_gone, pace=False, greet=False):
+async def run_session(session, websocket, audio_q, last_audio, state, client_gone):
     """Gemini connection manager."""
 
     async def send_audio():
@@ -218,25 +211,6 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                     )
                 )
 
-    out_q = asyncio.Queue()
-
-    async def send_to_client():
-        """Gemini की आवाज़ क्लाइंट तक भेजता है। ESP32 के लिए रफ़्तार नियंत्रित रखता है।"""
-        t0 = None
-        sent = 0.0
-        while True:
-            chunk = await out_q.get()
-            if pace:
-                now = time.monotonic()
-                if t0 is None or now - t0 > sent + 0.3:   # पिछला जवाब बज चुका, यह नया जवाब है
-                    t0 = now
-                    sent = 0.0
-                ahead = sent - (now - t0)
-                if ahead > LEAD_SEC:
-                    await asyncio.sleep(ahead - LEAD_SEC)
-            await websocket.send_bytes(chunk)
-            sent += len(chunk) / BYTES_PER_SEC
-
     async def receive_from_gemini():
         while True:
             got_any = False
@@ -259,11 +233,6 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
 
                 if sc:
                     if getattr(sc, "interrupted", False):
-                        while not out_q.empty():
-                            try:
-                                out_q.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
                         await websocket.send_text("interrupted")
 
                     if DEBUG_HEAR:
@@ -271,12 +240,24 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                         if it and getattr(it, "text", None):
                             logger.info(f"AI ने सुना: {it.text}")
 
-                        ot = getattr(sc, "output_transcription", None)
-                        if ot and getattr(ot, "text", None):
+                    ot = getattr(sc, "output_transcription", None)
+                    if ot and getattr(ot, "text", None):
+                        if DEBUG_HEAR:
                             logger.info(f"AI ने बोला: {ot.text}")
+
+                        # ESP32 के लिए: मज़ाकिया जवाब हो तो स्क्रीन पर दिखाने के लिए इमोजी भेजो (हर जवाब में एक बार)
+                        if state.get("device") == "esp32" and not state.get("emoji_sent"):
+                            state["turn_text"] = state.get("turn_text", "") + ot.text
+                            emoji_name = pick_emoji(state["turn_text"])
+                            if emoji_name:
+                                state["emoji_sent"] = True
+                                logger.info(f"इमोजी भेज रहे हैं: {emoji_name}")
+                                await websocket.send_text("emoji:" + emoji_name)
 
                     if getattr(sc, "turn_complete", False):
                         logger.info("AI का जवाब पूरा हुआ")
+                        state["turn_text"] = ""
+                        state["emoji_sent"] = False
 
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
@@ -287,7 +268,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                                 # ESP32 के लिए आवाज़ छोटे टुकड़ों (4096 बाइट) में भेजो, ताकि उसकी मेमोरी पर बोझ न पड़े
                                 audio = part.inline_data.data
                                 for i in range(0, len(audio), 4096):
-                                    out_q.put_nowait(audio[i:i + 4096])
+                                    await websocket.send_bytes(audio[i:i + 4096])
 
             if not got_any:
                 await asyncio.sleep(0.05)
@@ -296,35 +277,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
         asyncio.create_task(send_audio()),
         asyncio.create_task(keepalive()),
         asyncio.create_task(receive_from_gemini()),
-        asyncio.create_task(send_to_client()),
     ]
-
-    async def send_greeting():
-        """जुड़ते ही एक बार अभिवादन बुलवाता है (हर कनेक्शन में सिर्फ़ एक बार)।"""
-        if state.get("greeted"):
-            return
-        state["greeted"] = True
-        if time.time() - LAST_GREET["t"] < 20:
-            return
-        LAST_GREET["t"] = time.time()
-        word = greeting_word()
-        text = (f'डिवाइस अभी चालू हुआ है। सिर्फ़ इतना बोलो: "{word}! मैं सहायक हूँ, बताइए कैसे मदद करूँ?" '
-                f'इसके अलावा कुछ मत बोलो।')
-        await asyncio.sleep(0.5)
-        try:
-            await session.send_realtime_input(text=text)
-            logger.info(f"जुड़ते ही अभिवादन भेजा: {word}")
-        except Exception as e1:
-            try:
-                await session.send_client_content(
-                    turns=types.Content(role="user", parts=[types.Part(text=text)]),
-                    turn_complete=True,
-                )
-                logger.info(f"जुड़ते ही अभिवादन भेजा (दूसरे तरीके से): {word}")
-            except Exception as e2:
-                logger.warning(f"अभिवादन नहीं भेज पाए: {e1} | {e2}")
-
-    greet_task = asyncio.create_task(send_greeting()) if greet else None
 
     gone = asyncio.create_task(client_gone.wait())
 
@@ -346,7 +299,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                     logger.error(f"Gemini कनेक्शन टूटा: {exc}")
 
     finally:
-        for t in tasks + [gone] + ([greet_task] if greet_task else []):
+        for t in tasks + [gone]:
             t.cancel()
 
 
@@ -373,7 +326,10 @@ async def live_websocket_endpoint(websocket: WebSocket):
     state = {
         "handle": None,
         "extras": True,
-        "last_error": ""
+        "last_error": "",
+        "device": device,
+        "turn_text": "",
+        "emoji_sent": False,
     }
 
     stats = {"bytes": 0, "t": time.time()}
@@ -399,8 +355,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                 audio_q.put_nowait(data)
 
-        except WebSocketDisconnect as e:
-            logger.info(f"Client disconnected from WebSocket (code={getattr(e, 'code', '?')})")
+        except WebSocketDisconnect:
+            logger.info("Client disconnected from WebSocket")
 
         except Exception as e:
             logger.error(f"Error receiving from client: {e}")
@@ -427,6 +383,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         state["handle"],
                         state["extras"],
                         realtime_config,
+                        transcribe=(device == "esp32"),
                     ),
                 ) as session:
 
@@ -442,8 +399,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         last_audio,
                         state,
                         client_gone,
-                        pace=(PACE_ESP32 and device == "esp32"),
-                        greet=(GREET_ON_CONNECT and device == "esp32"),
                     )
 
             except Exception as e:
@@ -467,12 +422,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 quota_hits += 1
 
                 if quota_hits > 6:
-                    logger.error("Gemini का कोटा खत्म है।")
-                    if device == "esp32":
-                        # ESP32 का कनेक्शन मत तोड़ो, थोड़ी देर रुककर फिर कोशिश करो
-                        quota_hits = 0
-                        await sleep_unless_gone(client_gone, 10)
-                        continue
+                    logger.error("Gemini का कोटा खत्म है, रुक रहे हैं।")
                     break
 
                 wait = min(3 * quota_hits, 15)
@@ -502,13 +452,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         quick_failures += 1
 
                         if quick_failures >= 3:
-                            logger.error(f"बार-बार कनेक्शन नहीं बन पाया: {state['last_error']}")
-                            if device == "esp32":
-                                # ESP32 का कनेक्शन मत तोड़ो, थोड़ी देर रुककर फिर कोशिश करो
-                                quick_failures = 0
-                                await sleep_unless_gone(client_gone, 10)
-                            else:
-                                break
+                            logger.error("बार-बार कनेक्शन नहीं बन पाया, रुक रहे हैं")
+                            break
 
                 else:
                     quick_failures = 0
