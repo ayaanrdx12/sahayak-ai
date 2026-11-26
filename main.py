@@ -34,6 +34,7 @@ DEBUG_HEAR = os.getenv("DEBUG_HEAR", "1") == "1"
 # इससे पता चलता है कि स्पीकर/एम्पलीफायर ठीक है या नहीं। बंद करना हो तो Render में GREET_ON_CONNECT = 0
 GREET_ON_CONNECT = os.getenv("GREET_ON_CONNECT", "1") == "1"
 IST = timezone(timedelta(hours=5, minutes=30))
+LAST_GREET = {"t": 0.0}   # कनेक्शन बार-बार टूटे तो हर बार अभिवादन न बोले (20 सेकंड में एक बार)
 
 
 def greeting_word():
@@ -303,6 +304,9 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
         if state.get("greeted"):
             return
         state["greeted"] = True
+        if time.time() - LAST_GREET["t"] < 20:
+            return
+        LAST_GREET["t"] = time.time()
         word = greeting_word()
         text = (f'डिवाइस अभी चालू हुआ है। सिर्फ़ इतना बोलो: "{word}! मैं सहायक हूँ, बताइए कैसे मदद करूँ?" '
                 f'इसके अलावा कुछ मत बोलो।')
@@ -395,8 +399,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                 audio_q.put_nowait(data)
 
-        except WebSocketDisconnect:
-            logger.info("Client disconnected from WebSocket")
+        except WebSocketDisconnect as e:
+            logger.info(f"Client disconnected from WebSocket (code={getattr(e, 'code', '?')})")
 
         except Exception as e:
             logger.error(f"Error receiving from client: {e}")
@@ -463,7 +467,12 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 quota_hits += 1
 
                 if quota_hits > 6:
-                    logger.error("Gemini का कोटा खत्म है, रुक रहे हैं।")
+                    logger.error("Gemini का कोटा खत्म है।")
+                    if device == "esp32":
+                        # ESP32 का कनेक्शन मत तोड़ो, थोड़ी देर रुककर फिर कोशिश करो
+                        quota_hits = 0
+                        await sleep_unless_gone(client_gone, 10)
+                        continue
                     break
 
                 wait = min(3 * quota_hits, 15)
@@ -493,8 +502,13 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         quick_failures += 1
 
                         if quick_failures >= 3:
-                            logger.error("बार-बार कनेक्शन नहीं बन पाया, रुक रहे हैं")
-                            break
+                            logger.error(f"बार-बार कनेक्शन नहीं बन पाया: {state['last_error']}")
+                            if device == "esp32":
+                                # ESP32 का कनेक्शन मत तोड़ो, थोड़ी देर रुककर फिर कोशिश करो
+                                quick_failures = 0
+                                await sleep_unless_gone(client_gone, 10)
+                            else:
+                                break
 
                 else:
                     quick_failures = 0
