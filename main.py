@@ -12,41 +12,72 @@ logger = logging.getLogger("Sahayak_AI")
 app = FastAPI(title="Sahayak AI Voice Backend")
 
 # ======================================================================
-# सिर्फ़ एक मॉडल: Gemini Live (Render में LIVE_MODEL में जो लिखा है वही चलेगा)
-# Pro मोड, ElevenLabs और Google Search पूरी तरह हटा दिए गए हैं
+# सहायक AI सर्वर – वर्ज़न 11
+# नया क्या है:
+#  1) AI की आवाज़ ESP32 को छोटे टुकड़ों (40 ms) में और असली रफ़्तार से भेजी जाती है (पहले एक साथ ढेर आ जाती थी,
+#     जिससे ESP32 का कनेक्शन टूट जाता था)।
+#  2) चुप्पी (silence) अब सर्वर खुद भरता है, इसलिए ESP32 को लगातार आवाज़ नहीं भेजनी पड़ती।
+#  3) शोर पर AI बिना वजह न बोले (VAD कम संवेदनशील) और हिंदी भाषा तय है (पहले कभी-कभी स्पेनिश बोल देता था)।
+#  4) AI को धीरे, साफ़ और सामान्य गति से बोलने को कहा गया है।
+#  5) इमोजी अब आवाज़ के साथ सही क्रम में जाते हैं।
 # ======================================================================
 LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.8-live").strip()
 
-# keepalive: हर 2 सेकंड में जाँचो, 3 सेकंड चुप्पी हो तो चुप्पी-ऑडियो भेजो
-KA_EVERY = 2
-KA_IDLE = 3
+# चुप्पी भरना: आवाज़ 0.25 सेकंड न आए तो 100 ms चुप्पी भेजो (असली रफ़्तार से)
+KA_EVERY = 0.1
+KA_IDLE = 0.25
 
 # 1 = ESP32 वाले डिवाइस में AI बीच में नहीं रुकेगा, अपना वाक्य पूरा करेगा
-# कोई गड़बड़ी करे तो Render में NO_INTERRUPT = 0 कर दें
 NO_INTERRUPT = os.getenv("NO_INTERRUPT", "1") == "1"
 
-# 1 = Render के Logs में दिखेगा कि AI ने आपकी आवाज़ में क्या सुना और क्या बोला (जाँच के लिए)
-# जाँच पूरी होने पर Render में DEBUG_HEAR = 0 कर सकते हैं
+# 1 = Render के Logs में दिखेगा कि AI ने क्या सुना और क्या बोला
 DEBUG_HEAR = os.getenv("DEBUG_HEAR", "1") == "1"
+
+# भाषा: hi-IN = हिंदी। अगर इससे Gemini गड़बड़ करे तो Render में SPEECH_LANG खाली कर दें (अपने-आप भी बंद हो जाएगा)
+SPEECH_LANG = os.getenv("SPEECH_LANG", "hi-IN").strip()
+# आवाज़ का नाम (खाली छोड़ेंगे तो Gemini की अपनी आवाज़)
+VOICE_NAME = os.getenv("VOICE_NAME", "").strip()
+
+# शोर पर बोलना शुरू न करे: LOW (कम) / HIGH (ज़्यादा)
+VAD_START = os.getenv("VAD_START_SENSITIVITY", "LOW").upper()
+# बोलना रुकने के बाद कितनी देर (ms) चुप्पी हो तो मान लो आपकी बात पूरी हुई
+VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "700"))
+
+# ESP32 को आवाज़ भेजने की रफ़्तार (24 kHz, 16 बिट = 48000 बाइट प्रति सेकंड)
+BYTES_PER_SEC = 48000
+FRAME = 1920                                       # हर टुकड़ा = 40 ms
+LEAD = float(os.getenv("AUDIO_LEAD", "0.5"))       # असली समय से इतने सेकंड आगे तक ही भेजो (ESP32 बफ़र 0.67 सेकंड का है)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# 100ms silence audio
+# 100ms silence audio (16 kHz, 16 बिट)
 SILENCE = bytes(3200)
+
+# ----------------------------------------------------------------------
+# गाना: अपने पुराने main.py से "कायर जो थे" से लेकर
+# "शायद शायर बना हूँ सिर्फ़ तू सुनने आए तो" तक की लाइनें कॉपी करके
+# नीचे तीन-तीन उद्धरण चिह्नों (""") के बीच चिपका दीजिए।
+# ----------------------------------------------------------------------
+SONG = """
+(यहाँ अपने पुराने main.py वाला गाना चिपकाइए)
+"""
 
 
 def make_realtime_config(no_interrupt):
-    """शोर कम पकड़ने के लिए: आसपास की आवाज़ पर बोलना शुरू न करे।
-    no_interrupt=True हो तो AI को बीच में टोका नहीं जा सकेगा।
-    Render में VAD_START_SENSITIVITY = LOW (कम) या HIGH (ज़्यादा) रख सकते हैं।"""
-    level = os.getenv("VAD_START_SENSITIVITY", "HIGH" if no_interrupt else "LOW").upper()
+    """शोर कम पकड़ने के लिए: आसपास की आवाज़ पर बोलना शुरू न करे।"""
     kwargs = {}
 
     try:
-        sensitivity = getattr(types.StartSensitivity, f"START_SENSITIVITY_{level}")
-        kwargs["automatic_activity_detection"] = types.AutomaticActivityDetection(
-            start_of_speech_sensitivity=sensitivity
-        )
+        start = getattr(types.StartSensitivity, f"START_SENSITIVITY_{VAD_START}")
+        try:
+            kwargs["automatic_activity_detection"] = types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=start,
+                silence_duration_ms=VAD_SILENCE_MS,
+            )
+        except Exception:
+            kwargs["automatic_activity_detection"] = types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=start
+            )
     except Exception:
         logger.warning("शोर वाली सेटिंग नहीं लग पाई: google-genai SDK अपडेट करें।")
 
@@ -66,13 +97,32 @@ def make_realtime_config(no_interrupt):
         return None
 
 
+def make_speech_config():
+    """हिंदी भाषा (और चाहें तो आवाज़ का नाम) तय करता है।"""
+    if not SPEECH_LANG and not VOICE_NAME:
+        return None
+    try:
+        kw = {}
+        if SPEECH_LANG:
+            kw["language_code"] = SPEECH_LANG
+        if VOICE_NAME:
+            kw["voice_config"] = types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_NAME)
+            )
+        return types.SpeechConfig(**kw)
+    except Exception as e:
+        logger.warning(f"भाषा वाली सेटिंग नहीं बन पाई: {e}")
+        return None
+
+
 def make_prompt(name, extra=""):
     return f"""आपकी पहचान: आपका नाम "{name}" है। आपको सहायक AI की टीम ने बनाया और ट्रेन किया है, और आपके मुख्य निर्माता आयान तुषार और आसी, आलिया, सौम्या हैं। जब कोई आपका नाम, आपको किसने बनाया, या किसने ट्रेन किया पूछे, तो हमेशा यही बताएँ: "मैं {name} हूँ, मुझे सहायक AI की टीम ने बनाया है, जिसे आयान ने ट्रेन किया है।" अपने आपको कभी Gemini या Google का मॉडल न बताएँ।
 
-आप {name} हैं, एक जीती-जागती दोस्त की तरह बात करें। हिंदी में जवाब दें, छोटे और सीधे, 1-2 वाक्य।{extra}
-भावनाओं के साथ बोलें: मज़ाक पर खुलकर हँसें, खुशी में उत्साहित हों, दुख की बात पर धीमी और नरम आवाज़ रखें, हैरानी में आवाज़ ऊँची करें, और ज़रूरत पड़े तो ज़ोर से चौंकें या चिल्लाएँ। हर बात में आवाज़ का उतार-चढ़ाव रखें, रोबोट की तरह सपाट न बोलें।
+आप {name} हैं, एक जीती-जागती दोस्त की तरह बात करें। हमेशा हिंदी में जवाब दें (कभी स्पेनिश, अंग्रेज़ी या किसी और भाषा में नहीं, चाहे शोर में कुछ भी सुनाई दे), छोटे और सीधे, 1-2 वाक्य।{extra}
+बोलने की गति: सामान्य, आराम से और साफ़ बोलें, जल्दबाज़ी या तेज़ी बिल्कुल नहीं। हर शब्द साफ़ सुनाई दे, वाक्यों के बीच हल्का ठहराव रखें।
+भावनाओं के साथ बोलें: मज़ाक पर खुलकर हँसें, खुशी में उत्साहित हों, दुख की बात पर धीमी और नरम आवाज़ रखें, हैरानी में आवाज़ ऊँची करें, और ज़रूरत पड़े तो ज़ोर से चौंकें या चिल्लाएँ। हर बात में आवाज़ का उतार-चढ़ाव रखें, रोबोट की तरह सपाट न बोलें, पर रफ़्तार हमेशा सामान्य रखें।
 
-बातचीत के नियम: अगर सवाल अधूरा लगे या बीच में कट गया हो, तो प्यार से कहें कि "आपकी बात अधूरी रह गई, ज़रा पूरी बताइए।" अगर सवाल साफ़ न हो, तो एक छोटा सवाल पलटकर पूछें। अगर आवाज़ साफ़ न सुनाई दे, तो विनम्रता से दोबारा बोलने को कहें। पहले छोटा सीधा जवाब दें, और ज़रूरत हो तभी थोड़ा और बताएँ। मुश्किल बात को आसान उदाहरण से समझाएँ। अंदाज़े से गलत जवाब न दें, जो न पता हो उसे सीधे बता दें।
+बातचीत के नियम: अगर सवाल अधूरा लगे या बीच में कट गया हो, तो प्यार से कहें कि "आपकी बात अधूरी रह गई, ज़रा पूरी बताइए।" अगर सवाल साफ़ न हो, तो एक छोटा सवाल पलटकर पूछें। अगर आवाज़ साफ़ न सुनाई दे या सिर्फ़ शोर लगे, तो बहुत छोटा सा "दोबारा बोलिए" कह दें, लंबा कुछ न कहें। पहले छोटा सीधा जवाब दें, और ज़रूरत हो तभी थोड़ा और बताएँ। मुश्किल बात को आसान उदाहरण से समझाएँ। अंदाज़े से गलत जवाब न दें, जो न पता हो उसे सीधे बता दें।
 
 खास जवाब (इन पर सर्च मत करो):
 1) सेंट मैरी स्कूल की प्रिंसिपल कौन हैं? जवाब: "सिस्टर क्रिस्टी राधिका सेंट मैरी स्कूल की प्रिंसिपल हैं।"
@@ -83,45 +133,7 @@ def make_prompt(name, extra=""):
 6) "तुषार थ्री क्या करता है?" (तुषार के बाद थ्री/three/3/तीन हो) तो जवाब: "तुषार थ्री अब DSPL में नहीं रहा, आवारा बनके घूम रहा है। हा हा हा!"
 7) "आयान फोर क्या करता है?" (आयान के बाद फोर/four/4/चार हो) तो जवाब: "आयान महान है, जिसने मुझे बनाया है। तुम सालो, ये सवाल मुझसे क्यों पूछ रहे हो, गरीब भिखमंगे?"
 8) "अर्ज़ किया है" गाना सुनाओ (या "अर्ज़ किया है" सॉन्ग सुनाओ) कहने पर 1-2 वाक्य की सीमा छोड़ दो और नीचे दिया पूरा गाना शुरू से आख़िर तक भाव के साथ गाओ, बीच में मत रुको। इस पर सर्च मत करो। बहुत धीमी, नरम और भावुक आवाज़ में, हल्की साँस के साथ, किसी दर्द भरे शायर की तरह गाओ। हर पंक्ति के बाद थोड़ा ठहरो, "हाय" और "इश्क़" शब्द पर आवाज़ में दर्द और मिठास लाओ, और आख़िरी पंक्ति बहुत धीमी और मद्धम करके खत्म करो। रोबोट की तरह सपाट मत पढ़ो। गाना यह है:
-कायर जो थे, वो शायर बने
-अब क्या-क्या करें ये इश्क़ में
-ना कहते थे कुछ जो, लगे खोज में
-क्या लफ़्ज़ चुने, नए आशिक़ ये
-इश्क़ में तेरे हैं फ़ैज़ बने
-अर्ज़ किया है
-हमने भी लिखा कुछ तेरे बारे में है
-ऐसे तू लगे कि ग़ुलाब है
-और ऐसे तू लगे कि ग़ुलाब है
-बागों में दिल के खिलके इन फ़िज़ाओं में छाए हो, हाय
-और वैसे हम तो तेरे ही ग़ुलाम हैं
-और वैसे हम तो तेरे ही ग़ुलाम हैं
-बादशाह दिल के तेरी बाज़ी में जो तू चाहे तो
-डूबे दिलों की क्या नाव बनूँ?
-मैं ख़ुद तैर पाऊँ ना आँखों में
-शायर की फ़ितरत में ही डूबना
-मैं क्या ही लड़ूँ तूफ़ानों से
-इश्क़ में तेरे हैं फ़ैज़ बने
-अर्ज़ किया है
-हमने भी लिखा कुछ तेरे बारे में है
-हाथों को संभालें मेरे हाथों में
-कैसे हाथों को संभालें मेरे हाथों में
-जब तक नींद ना आए, इन लकीरों में बातें हो, हाय
-हाँ, सब ने तो सब कह दिया है
-क्या ही कहूँ जो अभी भी अनकहा है
-मैं, हाय, ना मिर्ज़ा, ना मीर, ना माहिर, ना ज़ाहिर
-करूँ कुछ नया मैं
-हाय, पर जो भी लिखा है, जिया है
-हाँ, जिया है
-ऐसे, ऐसे, ऐसे, कैसे, वैसे, जैसे
-जैसे मैं पढ़ूँ मेरे दिल में जो
-मेरी आँखें भी पढ़ें तेरी आँखों को
-क्या यह महफ़िल में बैठें या उठें
-दौड़ जाने को? हाय
-तेरी आँखों में तारीफ़ों की तलाश है
-मेरी महफ़िल तेरे जाने से वीरान है
-मैं बस शायर बना हूँ
-सिर्फ़ तू सुनने आए तो
-शायद शायर बना हूँ सिर्फ़ तू सुनने आए तो
+{SONG}
 नंबर वाले सवाल (4 से 7) में नंबर न हो तो वह खास जवाब मत दो, आम तरीके से बात करो। ये खास जवाब सिर्फ़ इन्हीं सवालों पर दो, अपनी तरफ़ से कभी नहीं।"""
 
 
@@ -143,7 +155,7 @@ def pick_emoji(text):
     return None
 
 
-def build_config(handle, extras, realtime_config, transcribe=False):
+def build_config(handle, extras, realtime_config, speech_config, transcribe=False):
     kwargs = dict(
         response_modalities=["AUDIO"],
         system_instruction=PROMPT,
@@ -152,14 +164,16 @@ def build_config(handle, extras, realtime_config, transcribe=False):
     if realtime_config is not None:
         kwargs["realtime_input_config"] = realtime_config
 
+    if speech_config is not None:
+        kwargs["speech_config"] = speech_config
+
     if DEBUG_HEAR:
         kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
 
-    # AI जो बोल रहा है उसका लिखा रूप: Logs देखने और ESP32 की स्क्रीन पर इमोजी दिखाने के काम आता है
+    # AI जो बोल रहा है उसका लिखा रूप: Logs और ESP32 की स्क्रीन पर इमोजी के काम आता है
     if DEBUG_HEAR or transcribe:
         kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
 
-    # Session Resumption and Context Compression
     if extras:
         kwargs["session_resumption"] = types.SessionResumptionConfig(handle=handle)
         kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
@@ -170,7 +184,6 @@ def build_config(handle, extras, realtime_config, transcribe=False):
 
 
 async def sleep_unless_gone(client_gone, seconds):
-    """इंतज़ार करता है, पर क्लाइंट चला जाए तो तुरंत रुक जाता है।"""
     try:
         await asyncio.wait_for(client_gone.wait(), timeout=seconds)
     except asyncio.TimeoutError:
@@ -185,30 +198,23 @@ async def root():
     }
 
 
-async def run_session(session, websocket, audio_q, last_audio, state, client_gone):
+async def run_session(session, out_q, audio_q, last_audio, state, client_gone):
     """Gemini connection manager."""
 
     async def send_audio():
         while True:
             data = await audio_q.get()
-
             await session.send_realtime_input(
-                audio=types.Blob(
-                    data=data,
-                    mime_type="audio/pcm;rate=16000"
-                )
+                audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
             )
 
     async def keepalive():
+        # आवाज़ न आ रही हो तो असली रफ़्तार से चुप्पी भरो, ताकि Gemini को बोलना रुकना ठीक से पता चले
         while True:
             await asyncio.sleep(KA_EVERY)
-
             if time.time() - last_audio["t"] > KA_IDLE:
                 await session.send_realtime_input(
-                    audio=types.Blob(
-                        data=SILENCE,
-                        mime_type="audio/pcm;rate=16000"
-                    )
+                    audio=types.Blob(data=SILENCE, mime_type="audio/pcm;rate=16000")
                 )
 
     async def receive_from_gemini():
@@ -219,7 +225,6 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                 got_any = True
 
                 upd = getattr(response, "session_resumption_update", None)
-
                 if upd and upd.resumable and upd.new_handle:
                     state["handle"] = upd.new_handle
 
@@ -233,7 +238,13 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
 
                 if sc:
                     if getattr(sc, "interrupted", False):
-                        await websocket.send_text("interrupted")
+                        # पुरानी बची आवाज़ फेंक दो
+                        while not out_q.empty():
+                            try:
+                                out_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        out_q.put_nowait(("text", "interrupted"))
 
                     if DEBUG_HEAR:
                         it = getattr(sc, "input_transcription", None)
@@ -245,14 +256,14 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                         if DEBUG_HEAR:
                             logger.info(f"AI ने बोला: {ot.text}")
 
-                        # ESP32 के लिए: मज़ाकिया जवाब हो तो स्क्रीन पर दिखाने के लिए इमोजी भेजो (हर जवाब में एक बार)
+                        # ESP32 के लिए: मज़ाकिया जवाब हो तो स्क्रीन पर दिखाने के लिए इमोजी (हर जवाब में एक बार)
                         if state.get("device") == "esp32" and not state.get("emoji_sent"):
                             state["turn_text"] = state.get("turn_text", "") + ot.text
                             emoji_name = pick_emoji(state["turn_text"])
                             if emoji_name:
                                 state["emoji_sent"] = True
                                 logger.info(f"इमोजी भेज रहे हैं: {emoji_name}")
-                                await websocket.send_text("emoji:" + emoji_name)
+                                out_q.put_nowait(("text", "emoji:" + emoji_name))
 
                     if getattr(sc, "turn_complete", False):
                         logger.info("AI का जवाब पूरा हुआ")
@@ -265,10 +276,8 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                                 if not state.get("got_audio_logged"):
                                     logger.info("Gemini से आवाज़ आना शुरू हुई")
                                     state["got_audio_logged"] = True
-                                # ESP32 के लिए आवाज़ छोटे टुकड़ों (4096 बाइट) में भेजो, ताकि उसकी मेमोरी पर बोझ न पड़े
-                                audio = part.inline_data.data
-                                for i in range(0, len(audio), 4096):
-                                    await websocket.send_bytes(audio[i:i + 4096])
+                                # आवाज़ सीधे नहीं भेजते; कतार में डालते हैं, भेजने वाला काम (sender) इसे रफ़्तार से भेजेगा
+                                out_q.put_nowait(("bin", part.inline_data.data))
 
             if not got_any:
                 await asyncio.sleep(0.05)
@@ -308,17 +317,18 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
-    # ESP32 वाला डिवाइस ?device=esp32 भेजता है। तभी AI बीच में नहीं रुकता।
     device = websocket.query_params.get("device", "")
     no_interrupt = NO_INTERRUPT and (device == "esp32")
 
     realtime_config = make_realtime_config(no_interrupt)
+    speech_config = make_speech_config()
 
     logger.info(
         f"Client connected | device={device or 'app'} | model={LIVE_MODEL} | no_interrupt={no_interrupt}"
     )
 
-    audio_q = asyncio.Queue(maxsize=200)
+    audio_q = asyncio.Queue(maxsize=400)   # डिवाइस से आई आवाज़ (Gemini के लिए)
+    out_q = asyncio.Queue()                # Gemini से आई आवाज़ और इमोजी (डिवाइस के लिए)
     client_gone = asyncio.Event()
 
     last_audio = {"t": time.time()}
@@ -326,6 +336,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
     state = {
         "handle": None,
         "extras": True,
+        "speech": True,
         "last_error": "",
         "device": device,
         "turn_text": "",
@@ -355,8 +366,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                 audio_q.put_nowait(data)
 
-        except WebSocketDisconnect:
-            logger.info("Client disconnected from WebSocket")
+        except WebSocketDisconnect as e:
+            logger.info(f"Client disconnected from WebSocket (code={getattr(e, 'code', '?')})")
 
         except Exception as e:
             logger.error(f"Error receiving from client: {e}")
@@ -364,7 +375,42 @@ async def live_websocket_endpoint(websocket: WebSocket):
         finally:
             client_gone.set()
 
+    async def sender():
+        """Gemini की आवाज़ को डिवाइस तक छोटे टुकड़ों में, असली रफ़्तार से (थोड़ा आगे तक) भेजता है।"""
+        t0 = 0.0
+        sent = 0.0   # अब तक भेजी आवाज़ कितने सेकंड की है
+        try:
+            while True:
+                kind, payload = await out_q.get()
+
+                if kind == "text":
+                    await websocket.send_text(payload)
+                    continue
+
+                for i in range(0, len(payload), FRAME):
+                    frame = payload[i:i + FRAME]
+                    now = time.monotonic()
+
+                    # सब कुछ बज चुका हो (नया जवाब शुरू) तो घड़ी नए सिरे से शुरू
+                    if sent == 0.0 or (now - t0) >= sent:
+                        t0 = now
+                        sent = 0.0
+
+                    ahead = sent - (now - t0)
+                    if ahead > LEAD:
+                        await asyncio.sleep(ahead - LEAD)
+
+                    await websocket.send_bytes(frame)
+                    sent += len(frame) / BYTES_PER_SEC
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.info(f"डिवाइस को भेजना रुका: {e}")
+            client_gone.set()
+
     reader = asyncio.create_task(read_client())
+    out_task = asyncio.create_task(sender())
 
     quick_failures = 0
     quota_hits = 0
@@ -383,6 +429,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         state["handle"],
                         state["extras"],
                         realtime_config,
+                        speech_config if state["speech"] else None,
                         transcribe=(device == "esp32"),
                     ),
                 ) as session:
@@ -394,7 +441,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                     await run_session(
                         session,
-                        websocket,
+                        out_q,
                         audio_q,
                         last_audio,
                         state,
@@ -408,7 +455,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
             if client_gone.is_set():
                 break
 
-            # Reset failure counters
             if time.time() - started > 20:
                 quota_hits = 0
                 quick_failures = 0
@@ -426,9 +472,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     break
 
                 wait = min(3 * quota_hits, 15)
-
                 logger.warning(f"कोटा सीमा: {wait} सेकंड रुककर दोबारा जुड़ेंगे")
-
                 await sleep_unless_gone(client_gone, wait)
 
                 if client_gone.is_set():
@@ -440,15 +484,14 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                 if time.time() - started < 4:
 
-                    if state["extras"]:
-
-                        logger.warning("रिज़ंप्शन के बिना दोबारा कोशिश कर रहे हैं")
-
+                    if state["extras"] or state["speech"]:
+                        # जल्दी टूटा: एक्स्ट्रा सेटिंग (रिज़ंप्शन, भाषा) हटाकर कोशिश करो
+                        logger.warning("रिज़ंप्शन और भाषा सेटिंग के बिना दोबारा कोशिश कर रहे हैं")
                         state["extras"] = False
+                        state["speech"] = False
                         state["handle"] = None
 
                     else:
-
                         quick_failures += 1
 
                         if quick_failures >= 3:
@@ -458,7 +501,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                 else:
                     quick_failures = 0
 
-            # Clear old audio
+            # पुरानी आवाज़ साफ़ करो
             while not audio_q.empty():
                 try:
                     audio_q.get_nowait()
@@ -472,6 +515,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
     finally:
 
         reader.cancel()
+        out_task.cancel()
 
         try:
             await websocket.close()
