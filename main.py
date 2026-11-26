@@ -25,6 +25,10 @@ KA_IDLE = 3
 # कोई गड़बड़ी करे तो Render में NO_INTERRUPT = 0 कर दें
 NO_INTERRUPT = os.getenv("NO_INTERRUPT", "1") == "1"
 
+# 1 = Render के Logs में दिखेगा कि AI ने आपकी आवाज़ में क्या सुना और क्या बोला (जाँच के लिए)
+# जाँच पूरी होने पर Render में DEBUG_HEAR = 0 कर सकते हैं
+DEBUG_HEAR = os.getenv("DEBUG_HEAR", "1") == "1"
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 100ms silence audio
@@ -133,6 +137,10 @@ def build_config(handle, extras, realtime_config):
     if realtime_config is not None:
         kwargs["realtime_input_config"] = realtime_config
 
+    if DEBUG_HEAR:
+        kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
+        kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
+
     # Session Resumption and Context Compression
     if extras:
         kwargs["session_resumption"] = types.SessionResumptionConfig(handle=handle)
@@ -209,6 +217,18 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                     if getattr(sc, "interrupted", False):
                         await websocket.send_text("interrupted")
 
+                    if DEBUG_HEAR:
+                        it = getattr(sc, "input_transcription", None)
+                        if it and getattr(it, "text", None):
+                            logger.info(f"AI ने सुना: {it.text}")
+
+                        ot = getattr(sc, "output_transcription", None)
+                        if ot and getattr(ot, "text", None):
+                            logger.info(f"AI ने बोला: {ot.text}")
+
+                    if getattr(sc, "turn_complete", False):
+                        logger.info("AI का जवाब पूरा हुआ")
+
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
                             if part.inline_data:
@@ -279,12 +299,20 @@ async def live_websocket_endpoint(websocket: WebSocket):
         "last_error": ""
     }
 
+    stats = {"bytes": 0, "t": time.time()}
+
     async def read_client():
         try:
             while True:
                 data = await websocket.receive_bytes()
 
                 last_audio["t"] = time.time()
+
+                stats["bytes"] += len(data)
+                if time.time() - stats["t"] > 5:
+                    logger.info(f"डिवाइस से पिछले 5 सेकंड में {stats['bytes']} बाइट आवाज़ मिली")
+                    stats["bytes"] = 0
+                    stats["t"] = time.time()
 
                 if audio_q.full():
                     try:
