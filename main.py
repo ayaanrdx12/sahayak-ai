@@ -29,6 +29,12 @@ NO_INTERRUPT = os.getenv("NO_INTERRUPT", "1") == "1"
 # जाँच पूरी होने पर Render में DEBUG_HEAR = 0 कर सकते हैं
 DEBUG_HEAR = os.getenv("DEBUG_HEAR", "1") == "1"
 
+# ESP32 के लिए आवाज़ असली रफ़्तार के पास भेजो (1 = चालू)। इससे ESP32 की मेमोरी नहीं भरती और आवाज़ टूटती नहीं।
+# कोई गड़बड़ी करे तो Render में PACE_ESP32 = 0 कर दें
+PACE_ESP32 = os.getenv("PACE_ESP32", "1") == "1"
+LEAD_SEC = float(os.getenv("LEAD_SEC", "0.8"))   # असली समय से इतनी सेकंड की आवाज़ आगे तक भेज दो
+BYTES_PER_SEC = 48000                            # 24 kHz x 16-बिट x मोनो
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 100ms silence audio
@@ -167,7 +173,7 @@ async def root():
     }
 
 
-async def run_session(session, websocket, audio_q, last_audio, state, client_gone):
+async def run_session(session, websocket, audio_q, last_audio, state, client_gone, pace=False):
     """Gemini connection manager."""
 
     async def send_audio():
@@ -193,6 +199,25 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                     )
                 )
 
+    out_q = asyncio.Queue()
+
+    async def send_to_client():
+        """Gemini की आवाज़ क्लाइंट तक भेजता है। ESP32 के लिए रफ़्तार नियंत्रित रखता है।"""
+        t0 = None
+        sent = 0.0
+        while True:
+            chunk = await out_q.get()
+            if pace:
+                now = time.monotonic()
+                if t0 is None or now - t0 > sent + 0.3:   # पिछला जवाब बज चुका, यह नया जवाब है
+                    t0 = now
+                    sent = 0.0
+                ahead = sent - (now - t0)
+                if ahead > LEAD_SEC:
+                    await asyncio.sleep(ahead - LEAD_SEC)
+            await websocket.send_bytes(chunk)
+            sent += len(chunk) / BYTES_PER_SEC
+
     async def receive_from_gemini():
         while True:
             got_any = False
@@ -215,6 +240,11 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
 
                 if sc:
                     if getattr(sc, "interrupted", False):
+                        while not out_q.empty():
+                            try:
+                                out_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
                         await websocket.send_text("interrupted")
 
                     if DEBUG_HEAR:
@@ -238,7 +268,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                                 # ESP32 के लिए आवाज़ छोटे टुकड़ों (4096 बाइट) में भेजो, ताकि उसकी मेमोरी पर बोझ न पड़े
                                 audio = part.inline_data.data
                                 for i in range(0, len(audio), 4096):
-                                    await websocket.send_bytes(audio[i:i + 4096])
+                                    out_q.put_nowait(audio[i:i + 4096])
 
             if not got_any:
                 await asyncio.sleep(0.05)
@@ -247,6 +277,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
         asyncio.create_task(send_audio()),
         asyncio.create_task(keepalive()),
         asyncio.create_task(receive_from_gemini()),
+        asyncio.create_task(send_to_client()),
     ]
 
     gone = asyncio.create_task(client_gone.wait())
@@ -365,6 +396,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         last_audio,
                         state,
                         client_gone,
+                        pace=(PACE_ESP32 and device == "esp32"),
                     )
 
             except Exception as e:
