@@ -39,7 +39,7 @@ def make_realtime_config(no_interrupt):
     """शोर कम पकड़ने के लिए: आसपास की आवाज़ पर बोलना शुरू न करे।
     no_interrupt=True हो तो AI को बीच में टोका नहीं जा सकेगा।
     Render में VAD_START_SENSITIVITY = LOW (कम) या HIGH (ज़्यादा) रख सकते हैं।"""
-    level = os.getenv("VAD_START_SENSITIVITY", "LOW").upper()
+    level = os.getenv("VAD_START_SENSITIVITY", "HIGH" if no_interrupt else "LOW").upper()
     kwargs = {}
 
     try:
