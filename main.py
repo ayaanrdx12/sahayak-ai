@@ -215,7 +215,10 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                                 if not state.get("got_audio_logged"):
                                     logger.info("Gemini से आवाज़ आना शुरू हुई")
                                     state["got_audio_logged"] = True
-                                await websocket.send_bytes(part.inline_data.data)
+                                # ESP32 के लिए आवाज़ छोटे टुकड़ों (4096 बाइट) में भेजो, ताकि उसकी मेमोरी पर बोझ न पड़े
+                                audio = part.inline_data.data
+                                for i in range(0, len(audio), 4096):
+                                    await websocket.send_bytes(audio[i:i + 4096])
 
             if not got_any:
                 await asyncio.sleep(0.05)
@@ -412,4 +415,3 @@ async def live_websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
-            
