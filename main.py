@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 import logging
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
@@ -28,6 +29,23 @@ NO_INTERRUPT = os.getenv("NO_INTERRUPT", "1") == "1"
 # 1 = Render के Logs में दिखेगा कि AI ने आपकी आवाज़ में क्या सुना और क्या बोला (जाँच के लिए)
 # जाँच पूरी होने पर Render में DEBUG_HEAR = 0 कर सकते हैं
 DEBUG_HEAR = os.getenv("DEBUG_HEAR", "1") == "1"
+
+# 1 = ESP32 के सर्वर से जुड़ते ही AI खुद समय के हिसाब से "गुड मॉर्निंग" जैसा अभिवादन बोलेगा
+# इससे पता चलता है कि स्पीकर/एम्पलीफायर ठीक है या नहीं। बंद करना हो तो Render में GREET_ON_CONNECT = 0
+GREET_ON_CONNECT = os.getenv("GREET_ON_CONNECT", "1") == "1"
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def greeting_word():
+    h = datetime.now(IST).hour
+    if 5 <= h < 12:
+        return "गुड मॉर्निंग"
+    if 12 <= h < 17:
+        return "गुड आफ्टरनून"
+    if 17 <= h < 21:
+        return "गुड इवनिंग"
+    return "नमस्ते"
+
 
 # ESP32 के लिए आवाज़ असली रफ़्तार के पास भेजो (1 = चालू)। इससे ESP32 की मेमोरी नहीं भरती और आवाज़ टूटती नहीं।
 # कोई गड़बड़ी करे तो Render में PACE_ESP32 = 0 कर दें
@@ -173,7 +191,7 @@ async def root():
     }
 
 
-async def run_session(session, websocket, audio_q, last_audio, state, client_gone, pace=False):
+async def run_session(session, websocket, audio_q, last_audio, state, client_gone, pace=False, greet=False):
     """Gemini connection manager."""
 
     async def send_audio():
@@ -280,6 +298,30 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
         asyncio.create_task(send_to_client()),
     ]
 
+    async def send_greeting():
+        """जुड़ते ही एक बार अभिवादन बुलवाता है (हर कनेक्शन में सिर्फ़ एक बार)।"""
+        if state.get("greeted"):
+            return
+        state["greeted"] = True
+        word = greeting_word()
+        text = (f'डिवाइस अभी चालू हुआ है। सिर्फ़ इतना बोलो: "{word}! मैं सहायक हूँ, बताइए कैसे मदद करूँ?" '
+                f'इसके अलावा कुछ मत बोलो।')
+        await asyncio.sleep(0.5)
+        try:
+            await session.send_realtime_input(text=text)
+            logger.info(f"जुड़ते ही अभिवादन भेजा: {word}")
+        except Exception as e1:
+            try:
+                await session.send_client_content(
+                    turns=types.Content(role="user", parts=[types.Part(text=text)]),
+                    turn_complete=True,
+                )
+                logger.info(f"जुड़ते ही अभिवादन भेजा (दूसरे तरीके से): {word}")
+            except Exception as e2:
+                logger.warning(f"अभिवादन नहीं भेज पाए: {e1} | {e2}")
+
+    greet_task = asyncio.create_task(send_greeting()) if greet else None
+
     gone = asyncio.create_task(client_gone.wait())
 
     try:
@@ -300,7 +342,7 @@ async def run_session(session, websocket, audio_q, last_audio, state, client_gon
                     logger.error(f"Gemini कनेक्शन टूटा: {exc}")
 
     finally:
-        for t in tasks + [gone]:
+        for t in tasks + [gone] + ([greet_task] if greet_task else []):
             t.cancel()
 
 
@@ -397,6 +439,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         state,
                         client_gone,
                         pace=(PACE_ESP32 and device == "esp32"),
+                        greet=(GREET_ON_CONNECT and device == "esp32"),
                     )
 
             except Exception as e:
