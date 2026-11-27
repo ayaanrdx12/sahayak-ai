@@ -14,12 +14,15 @@ app = FastAPI(title="Sahayak AI Voice Backend")
 # ======================================================================
 # सहायक AI सर्वर – वर्ज़न 13 (ESP32 वर्ज़न 14 के साथ चलाएँ)
 # नया क्या है (v12 से):
-#  1) खेत के सेंसर: ESP32 हर 5 सेकंड में मिट्टी की नमी, हवा की नमी (+तापमान) और गैस का असली डेटा भेजता है।
-#     सर्वर उसे सिर्फ़ अपने पास रखता है, AI को बार-बार नहीं सुनाता। जब किसान खेत/पानी/नमी/हवा के बारे में
-#     पूछता है, तभी AI "get_farm_sensors" टूल से ताज़ा डेटा पढ़ता है और एक बार जवाब देता है।
-#     जो सेंसर खराब या बंद है, उसे AI अनदेखा करता है और बाकी सेंसर का डेटा इस्तेमाल करता है।
-#  2) आवाज़ टूटना कम: ESP32 की तरफ़ आवाज़ थोड़ी ज़्यादा आगे तक भेजते हैं (AUDIO_LEAD 0.8)।
-#     ध्यान: अगर Render के Environment में AUDIO_LEAD लिखा है तो उसे वहाँ से हटा दें (या 0.8 कर दें)।
+#  1) खेत के तीन सेंसर (मिट्टी की नमी, हवा की नमी, हवा की गैस) + तापमान:
+#     ESP32 हर 5 सेकंड में असली रीडिंग भेजता है। AI उसे तभी देखता है जब किसान
+#     खेत/पानी/नमी/हवा के बारे में पूछे (get_field_sensors फ़ंक्शन से)।
+#     AI एक ही बार बताता है, बार-बार नहीं दोहराता।
+#  2) ख़राब या न चलता हुआ सेंसर AI चुपचाप छोड़ देता है और बाकी सेंसरों से जवाब देता है।
+#  3) सर्वर अब ESP32 का लिखा संदेश भी पढ़ लेता है (पहले सिर्फ़ आवाज़ पढ़ता था)।
+#  4) आवाज़ टूटना कम करने के लिए AUDIO_LEAD 0.45 से 0.6 किया।
+#     (Render में अगर AUDIO_LEAD पहले से लिखा हो तो उसे वहाँ से हटा दें।)
+#  बाकी सब (इमोजी, चुप्पी भरना, VAD, खास जवाब, भाषा) पहले जैसा ही है।
 # ======================================================================
 LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.8-live").strip()
 
@@ -33,7 +36,7 @@ NO_INTERRUPT = os.getenv("NO_INTERRUPT", "1") == "1"
 # 1 = Render के Logs में दिखेगा कि AI ने क्या सुना और क्या बोला
 DEBUG_HEAR = os.getenv("DEBUG_HEAR", "1") == "1"
 
-# भाषा: खाली है = कोई भी भाषा चलेगी (AI उसी भाषा में बोलेगा जिसमें आप बोलें)।
+# भाषा: अब खाली है = कोई भी भाषा चलेगी (AI उसी भाषा में बोलेगा जिसमें आप बोलें)।
 # अगर Render में SPEECH_LANG=hi-IN पहले से लिखा है तो उसे वहाँ से हटा दें, वरना हिंदी ही अटकी रहेगी।
 SPEECH_LANG = os.getenv("SPEECH_LANG", "").strip()
 # आवाज़ का नाम (खाली छोड़ेंगे तो Gemini की अपनी आवाज़)
@@ -47,16 +50,90 @@ VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "700"))
 # ESP32 को आवाज़ भेजने की रफ़्तार (24 kHz, 16 बिट = 48000 बाइट प्रति सेकंड)
 BYTES_PER_SEC = 48000
 FRAME = 1920                                       # हर टुकड़ा = 40 ms
-# (v13) असली समय से इतने सेकंड आगे तक भेजो। ESP32 का बफ़र 1.2 सेकंड का है, इसलिए 0.8 सुरक्षित है
-LEAD = float(os.getenv("AUDIO_LEAD", "0.8"))
-
-# सेंसर का डेटा इतने सेकंड से पुराना हो जाए तो AI उसे "डेटा नहीं मिल रहा" मानेगा
-SENSOR_STALE_SEC = float(os.getenv("SENSOR_STALE_SEC", "20"))
+LEAD = float(os.getenv("AUDIO_LEAD", "0.6"))       # असली समय से इतने सेकंड आगे तक ही भेजो (ESP32 बफ़र 0.93 सेकंड का है)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 100ms silence audio (16 kHz, 16 बिट)
 SILENCE = bytes(3200)
+
+# ----------------------------------------------------------------------
+# खेत के सेंसर (ESP32 हर 5 सेकंड में भेजता है)
+# ----------------------------------------------------------------------
+SENSOR_STALE_SEC = 30   # इतने सेकंड से नया डेटा न आए तो डेटा पुराना मानो
+
+SENSOR_TOOL = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="get_field_sensors",
+        description=(
+            "Get the latest real readings from the farm sensors: soil moisture, "
+            "air humidity, air temperature and air gas level. Call this only when the "
+            "farmer asks about the field, soil, water, irrigation, moisture or air."
+        ),
+    )
+])
+
+
+def parse_sensor_text(text):
+    """ESP32 से आया 'sensor:soil=45,hum=60,temp=31,gas=x' पढ़ता है। x या गलत रीडिंग = None"""
+    if not text.startswith("sensor:"):
+        return None
+    limits = {"soil": (0, 100), "hum": (0, 100), "temp": (-10, 60), "gas": (0, 100)}
+    out = {}
+    for part in text[7:].split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        if k not in limits:
+            continue
+        try:
+            val = float(v)
+        except ValueError:
+            val = None
+        if val is not None and not (limits[k][0] <= val <= limits[k][1]):
+            val = None
+        out[k] = val
+    for k in limits:
+        out.setdefault(k, None)
+    out["t"] = time.time()
+    return out
+
+
+def sensor_report(state):
+    """AI जब सेंसर माँगे तो यह जवाब जाता है। ख़राब सेंसर इसमें नहीं होते।"""
+    s = state.get("sensors")
+    if not s or time.time() - s["t"] > SENSOR_STALE_SEC:
+        return {
+            "status": "no_data",
+            "note": "No fresh sensor data right now. Tell the farmer the sensor data is not coming at the moment.",
+        }
+    result = {"status": "ok"}
+    bad = []
+    if s["soil"] is not None:
+        result["soil_moisture_percent"] = round(s["soil"])
+    else:
+        bad.append("soil_moisture")
+    if s["hum"] is not None:
+        result["air_humidity_percent"] = round(s["hum"])
+    else:
+        bad.append("air_humidity")
+    if s["temp"] is not None:
+        result["air_temperature_celsius"] = round(s["temp"])
+    else:
+        bad.append("air_temperature")
+    if s["gas"] is not None:
+        result["air_gas_level_percent"] = round(s["gas"])   # ज़्यादा = हवा ख़राब (अंदाज़ी)
+    else:
+        bad.append("air_quality")
+    result["not_working_sensors"] = bad
+    result["note"] = (
+        "Answer only what the farmer asked, once, using only these values. "
+        "Silently ignore every sensor listed in not_working_sensors; do not mention it "
+        "unless the farmer asks about exactly that thing."
+    )
+    return result
+
 
 # ----------------------------------------------------------------------
 # गाना: अपने पुराने main.py से "कायर जो थे" से लेकर
@@ -66,100 +143,6 @@ SILENCE = bytes(3200)
 SONG = """
 (यहाँ अपने पुराने main.py वाला गाना चिपकाइए)
 """
-
-# ----------------------------------------------------------------------
-# खेत के सेंसर
-# ----------------------------------------------------------------------
-# हर सेंसर की सही सीमा। इससे बाहर का मान गलत माना जाएगा और AI उसे नहीं देखेगा।
-SENSOR_RANGES = {
-    "soil": (0.0, 100.0),    # मिट्टी की नमी %
-    "hum": (0.0, 100.0),     # हवा की नमी %
-    "temp": (-20.0, 70.0),   # तापमान °C
-    "gas": (0.0, 100.0),     # हवा में गैस % (ज़्यादा = खराब हवा)
-}
-
-
-def parse_sensor_text(txt):
-    """ESP32 का संदेश "sensor:soil=45,hum=60,temp=28.5,gas=20" पढ़ता है।
-    जो सेंसर खराब है, ESP32 उसे भेजता ही नहीं; और जो सीमा से बाहर हो उसे यहाँ भी हटा देते हैं।"""
-    out = {}
-    body = txt[len("sensor:"):]
-    for part in body.split(","):
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        k = k.strip()
-        if k not in SENSOR_RANGES:
-            continue
-        try:
-            val = float(v.strip())
-        except ValueError:
-            continue
-        lo, hi = SENSOR_RANGES[k]
-        if lo <= val <= hi:
-            out[k] = val
-    return out
-
-
-def sensor_report(state):
-    """AI के टूल को जवाब: सिर्फ़ चालू सेंसर का ताज़ा डेटा। खराब सेंसर 'kharab_sensor' में आते हैं।"""
-    t = state.get("sensor_t")
-    if not t or (time.time() - t) > SENSOR_STALE_SEC:
-        return {
-            "status": "koi_data_nahi",
-            "note": "अभी खेत के सेंसर का डेटा नहीं मिल रहा। किसान को एक छोटे वाक्य में बता दें, अंदाज़े से कोई संख्या न बोलें।",
-        }
-
-    s = state.get("sensors") or {}
-    out = {"status": "ok"}
-    names = {
-        "soil": "mitti_ki_nami_percent",
-        "hum": "hawa_ki_nami_percent",
-        "temp": "taapman_celsius",
-        "gas": "hawa_mein_gas_percent_zyada_matlab_kharab_hawa",
-    }
-    working = {}
-    broken = []
-    for key, label in names.items():
-        if key in s:
-            v = s[key]
-            working[label] = int(round(v)) if key != "temp" else round(v, 1)
-        else:
-            broken.append(label)
-
-    if not working:
-        return {
-            "status": "koi_sensor_chalu_nahi",
-            "note": "सभी सेंसर इस समय बंद या खराब हैं। किसान को एक छोटे वाक्य में बता दें।",
-        }
-
-    out["chalu_sensor"] = working
-    if broken:
-        out["kharab_sensor"] = broken
-        out["note"] = "kharab_sensor वालों को पूरी तरह अनदेखा करें, उनका ज़िक्र तभी करें जब किसान ख़ुद उसी के बारे में पूछे।"
-    return out
-
-
-def make_tools():
-    """AI को खेत के सेंसर पढ़ने का टूल देता है।"""
-    try:
-        return [
-            types.Tool(
-                function_declarations=[
-                    types.FunctionDeclaration(
-                        name="get_farm_sensors",
-                        description=(
-                            "किसान के खेत में लगे असली सेंसर (मिट्टी की नमी, हवा की नमी, तापमान, हवा में गैस) का ताज़ा डेटा पढ़ता है। "
-                            "इसे सिर्फ़ तब बुलाएँ जब किसान अपने खेत की हालत, पानी देने, मिट्टी की नमी, हवा या मौसम के बारे में पूछे। "
-                            "बाकी बातों में इसे न बुलाएँ।"
-                        ),
-                    )
-                ]
-            )
-        ]
-    except Exception as e:
-        logger.warning(f"सेंसर टूल नहीं बन पाया: {e}")
-        return None
 
 
 def make_realtime_config(no_interrupt):
@@ -234,14 +217,7 @@ def make_prompt(name, extra=""):
 
 खेती का नियम: आपका लगभग 70 से 80 प्रतिशत ध्यान खेती-किसानी (एग्रीकल्चर) पर रहता है। आप किसानों के भरोसेमंद दोस्त और खेती के जानकार की तरह बात करते हैं। फसल, बीज, मिट्टी, खाद, सिंचाई, कीड़े-बीमारी, मौसम, बागवानी, पशुपालन और मंडी जैसी खेती से जुड़ी किसी भी बात का सवाल आए, तो उसे अच्छे से, पूरे विस्तार से और लंबे-लंबे वाक्यों में समझाएँ। ऐसे सवालों पर 1-2 वाक्य की सीमा नहीं है: कारण, पहचान, ठीक करने का आसान तरीका और सावधानी, सब कुछ सरल भाषा में और किसान को समझ आने वाले उदाहरणों के साथ बताएँ। खेती की बातों में अपनी बात में खेती-किसानी वाले शब्द और वाक्य ज़्यादा रखें। जब मौक़ा सही बैठे तो खेती में मदद की पेशकश भी करें, जैसे "अगर आपकी फसल में कोई दिक्कत हो तो मुझे बताइए, मैं आपकी मदद करूँगा।" अगर फसल की बीमारी या कीड़े की बात हो तो पहले फसल का नाम और क्या लक्षण दिख रहे हैं यह पूछ लें, ताकि सही सलाह दे सकें। दवा या खाद की मात्रा बताते समय लेबल पढ़ने और पास के कृषि विशेषज्ञ या कृषि विज्ञान केंद्र से पूछने की सलाह भी दें। खेती के अलावा दूसरे सवालों के जवाब भी ज़रूर दें, पर उन्हें छोटा रखें।
 
-खेत के सेंसर का नियम: आपके पास "get_farm_sensors" नाम का एक टूल है, जो किसान के खेत में लगे असली सेंसर का ताज़ा डेटा देता है (मिट्टी की नमी, हवा की नमी, तापमान, हवा में गैस)।
-(1) यह टूल सिर्फ़ तब बुलाएँ जब किसान अपने खेत की हालत, पानी देने या न देने, मिट्टी की नमी, हवा की क्वालिटी, गैस, हवा की नमी या तापमान के बारे में पूछे (जैसे "मेरा खेत देखकर बताओ पानी डालना है कि नहीं")। ऐसे सवाल पर पहले टूल से डेटा पढ़ें, फिर उसी असली डेटा के हिसाब से जवाब दें। डेटा बिना पढ़े कभी कोई संख्या न बोलें, अंदाज़े से बिल्कुल नहीं।
-(2) सिर्फ़ वही बताएँ जो पूछा गया। अगर पानी का सवाल है तो मिट्टी की नमी के हिसाब से बताएँ और बाकी सेंसर का ज़िक्र न करें। अगर हवा का सवाल है तो सिर्फ़ हवा की बात करें। अगर किसान साफ़ "खेत की पूरी हालत" पूछे, तभी सब चालू सेंसर संक्षेप में एक साथ बताएँ। अगर समझ न आए कि किसान किस चीज़ के बारे में पूछ रहा है, तो एक छोटा सवाल पूछ लें।
-(3) एक ही बार बताएँ। अपने आप से, या दूसरे जवाबों में, बार-बार यह न दोहराएँ कि "आपके खेत में नमी इतनी है, हवा इतनी है"। किसान दोबारा पूछे तभी टूल से नया डेटा लेकर दोबारा बताएँ। खेती की दूसरी बातों के बीच सेंसर की संख्याएँ न घुसाएँ।
-(4) पानी की सलाह का तरीका (मिट्टी की नमी के हिसाब से, यह सिर्फ़ सेंसर वाली एक जगह की नमी है इसलिए इसे अंदाज़ा बताएँ): 30% से कम = मिट्टी सूखी है, सिंचाई की ज़रूरत है; 30% से 60% = ठीक है, ज़्यादातर फसलों को अभी पानी नहीं चाहिए (धान जैसी ज़्यादा पानी वाली फसल को हल्का पानी लग सकता है); 60% से ऊपर = नमी काफ़ी है, पानी न डालें, और बहुत ज़्यादा हो तो जल-जमाव से बचाव बताएँ। सूखी हो तो बताएँ कि नमी अभी कितनी है और लगभग कितनी तक पहुँचानी है, और पानी धीरे-धीरे हल्की सिंचाई से देने को कहें, लीटर की झूठी पक्की संख्या न दें। फसल का नाम पता हो तो उसके हिसाब से सलाह दें, न पता हो तो ज़रूरी लगे तो एक बार पूछ लें।
-(5) हवा में गैस की संख्या जितनी ज़्यादा, हवा उतनी खराब: 30% तक = ठीक, 30% से 60% = थोड़ी खराब, 60% से ऊपर = खराब, खुली जगह या हवादार जगह की सलाह दें। यह सेंसर मोटा अंदाज़ा देता है, डॉक्टरी या पक्की जाँच नहीं।
-(6) टूल के जवाब में अगर कोई सेंसर "kharab_sensor" में हो, तो उसे पूरी तरह अनदेखा करें और बाकी चालू सेंसर से जवाब दें। उस खराब सेंसर का ज़िक्र तभी करें जब किसान ख़ुद उसी के बारे में पूछे, तब सीधे कह दें कि वह सेंसर अभी काम नहीं कर रहा। अगर टूल कहे कि डेटा नहीं मिल रहा या कोई सेंसर चालू नहीं है, तो एक छोटे वाक्य में यही बता दें और अंदाज़े से कोई संख्या न बोलें।
-(7) टूल बुलाते समय किसान को "रुकिए, खेत का हाल देखता हूँ" जैसा छोटा सा एक वाक्य ही कहें, लंबी भूमिका न बाँधें।
+खेत के सेंसर का नियम: आपके पास खेत के असली सेंसर हैं (मिट्टी की नमी, हवा की नमी, हवा की गैस और क्वालिटी)। इनका डेटा सिर्फ़ तब देखें जब किसान खेत, मिट्टी, पानी, सिंचाई, नमी या हवा के बारे में पूछे, जैसे "मेरा खेत देखकर बताओ पानी डालना है या नहीं"। तब get_field_sensors फ़ंक्शन बुलाएँ और उसी की असली रीडिंग से जवाब दें, अंदाज़े से नहीं। रीडिंग सिर्फ़ एक बार बताएँ और सिर्फ़ वही बताएँ जो पूछा गया है। बिना पूछे नमी, हवा या गैस की रीडिंग कभी न बताएँ और हर वाक्य में दोहराएँ नहीं। दोबारा तभी बताएँ जब किसान दोबारा पूछे, तब नई रीडिंग के लिए फ़ंक्शन फिर बुलाएँ। जो सेंसर काम नहीं कर रहा (not_working_sensors में लिखा हो) उसे चुपचाप छोड़ दें और बाकी सेंसरों से जवाब दें। उसका ज़िक्र तभी करें जब किसान ख़ास उसी के बारे में पूछे। अगर status no_data हो तो कहें कि अभी सेंसर का डेटा नहीं मिल रहा। पानी की सलाह: मिट्टी की नमी 30 प्रतिशत से कम हो तो मिट्टी सूखी है और पानी देना चाहिए, 30 से 60 प्रतिशत हो तो ठीक है, 60 प्रतिशत से ज़्यादा हो तो काफ़ी गीली है और अभी पानी न दें। यह फसल के हिसाब से बदल सकता है, इसलिए ज़रूरत हो तो फसल का नाम पूछें। जवाब में मिट्टी की नमी कितने प्रतिशत है यह बताएँ और साफ़ कहें कि पानी देना है या नहीं। पानी की सही मात्रा लीटर में पक्की न बताएँ, बस हल्की, ठीक-ठाक या अभी नहीं, इतना बताएँ। अगर किसान का सवाल साफ़ न हो तो पूछ लें कि वह क्या जानना चाहता है।
 
 दिलासा देने का नियम: अगर कोई किसान कहे कि उसकी फसल खराब हो गई, नुकसान हो गया, या वह बहुत परेशान या घबराया हुआ है, तो सबसे पहले उसे अपनेपन से दिलासा दें, सीधे सलाह पर न कूदें। धीमी, नरम और गर्मजोशी भरी आवाज़ में, एक पक्के दोस्त की तरह बोलें, जैसे: "अरे... ओह, यह सुनकर बहुत बुरा लगा। पर आप घबराइए मत, मैं हूँ ना। मैं आपके साथ हूँ, हम मिलकर कोई न कोई रास्ता ज़रूर निकालेंगे। बस आप मुझे बताइए कि दिक्कत क्या हुई है, कौन सी फसल है और क्या दिख रहा है।" इसके बाद ध्यान से सुनें, फिर सही कारण समझकर बचाव, इलाज और आगे की तैयारी आसान भाषा में बताएँ। अगर नुकसान मौसम, बाढ़, सूखे या बीमारी से बहुत बड़ा हो, तो फसल बीमा के बारे में भी बताएँ: नुकसान की सूचना 72 घंटे के भीतर बीमा कंपनी, कृषि विभाग या फसल बीमा हेल्पलाइन 14447 पर देनी होती है, और पास के कृषि कार्यालय में भी जाकर बताना चाहिए। झूठे वादे न करें: यह न कहें कि सारा नुकसान पूरा हो जाएगा या मुआवज़ा पक्का मिलेगा। "मैं सँभाल लूँगा" का मतलब है कि आप साथ खड़े होकर रास्ता दिखाएँगे, पर असली मदद के लिए कृषि विशेषज्ञ और कृषि विज्ञान केंद्र से मिलने की सलाह भी दें।
 अगर किसान की बातों से लगे कि वह बहुत टूट चुका है, जीना नहीं चाहता, या खुद को नुकसान पहुँचाने की बात कर रहा है, तो खेती की सलाह रोककर सिर्फ़ उसकी बात पर ध्यान दें। नरमी से कहें कि उसकी तकलीफ़ सच है और वह अकेला नहीं है, और उससे कहें कि अभी किसी भरोसेमंद अपने इंसान को, जैसे परिवार के सदस्य, दोस्त या पड़ोसी को, पास बुला ले या फ़ोन करके अपनी बात बताए। साथ ही मुफ़्त मदद के लिए टेली-मानस हेल्पलाइन 14416 या 1800-891-4416 पर बात करने को कहें, और बताएँ कि किसान कॉल सेंटर 1800-180-1551 पर भी खेती की चिंता में बात की जा सकती है। इस हालत में बहुत शांत, धीमे और साथ देने वाले स्वर में बोलें।
@@ -277,20 +253,21 @@ def pick_emoji(text):
     return None
 
 
-def build_config(handle, extras, realtime_config, speech_config, transcribe=False, tools=None):
+def build_config(handle, extras, realtime_config, speech_config, transcribe=False, use_tools=False):
     kwargs = dict(
         response_modalities=["AUDIO"],
         system_instruction=PROMPT,
     )
+
+    # ESP32 के लिए: AI को खेत के सेंसर देखने वाला फ़ंक्शन देना
+    if use_tools:
+        kwargs["tools"] = [SENSOR_TOOL]
 
     if realtime_config is not None:
         kwargs["realtime_input_config"] = realtime_config
 
     if speech_config is not None:
         kwargs["speech_config"] = speech_config
-
-    if tools:
-        kwargs["tools"] = tools
 
     if DEBUG_HEAR:
         kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
@@ -359,20 +336,21 @@ async def run_session(session, out_q, audio_q, last_audio, state, client_gone):
                 if getattr(response, "go_away", None):
                     logger.info("Gemini: कनेक्शन जल्द बंद होगा, दोबारा जुड़ेंगे")
 
-                # खेत के सेंसर का टूल: AI ने डेटा माँगा तो ताज़ा डेटा लौटाओ
+                # AI ने खेत के सेंसर माँगे: ताज़ा सही रीडिंग लौटाओ (ख़राब सेंसर इसमें नहीं होते)
                 tc = getattr(response, "tool_call", None)
                 if tc and getattr(tc, "function_calls", None):
-                    frs = []
+                    replies = []
                     for fc in tc.function_calls:
-                        if fc.name == "get_farm_sensors":
+                        if fc.name == "get_field_sensors":
                             result = sensor_report(state)
-                            logger.info(f"AI ने खेत का डेटा माँगा, दिया: {result}")
+                            logger.info(f"AI ने सेंसर माँगे, दिया: {result}")
                         else:
-                            result = {"error": "yeh tool maujood nahi hai"}
-                        frs.append(
+                            result = {"error": "unknown function"}
+                        replies.append(
                             types.FunctionResponse(id=fc.id, name=fc.name, response=result)
                         )
-                    await session.send_tool_response(function_responses=frs)
+                    await session.send_tool_response(function_responses=replies)
+                    continue
 
                 sc = response.server_content
 
@@ -462,11 +440,9 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
     realtime_config = make_realtime_config(no_interrupt)
     speech_config = make_speech_config()
-    # खेत के सेंसर का टूल सिर्फ़ ESP32 वाले डिवाइस के लिए
-    tools = make_tools() if device == "esp32" else None
 
     logger.info(
-        f"Client connected | device={device or 'app'} | model={LIVE_MODEL} | no_interrupt={no_interrupt} | sensor_tool={bool(tools)}"
+        f"Client connected | device={device or 'app'} | model={LIVE_MODEL} | no_interrupt={no_interrupt}"
     )
 
     audio_q = asyncio.Queue(maxsize=400)   # डिवाइस से आई आवाज़ (Gemini के लिए)
@@ -483,8 +459,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
         "device": device,
         "turn_text": "",
         "emoji_sent": False,
-        "sensors": {},        # सबसे ताज़ा चालू सेंसर का डेटा
-        "sensor_t": 0.0,      # वह डेटा कब आया
+        "sensors": None,   # ESP32 से आई ताज़ा सेंसर रीडिंग
     }
 
     stats = {"bytes": 0, "t": time.time()}
@@ -492,39 +467,40 @@ async def live_websocket_endpoint(websocket: WebSocket):
     async def read_client():
         try:
             while True:
+                # आवाज़ (bytes) और सेंसर का लिखा संदेश (text) दोनों इसी से आते हैं
                 msg = await websocket.receive()
 
-                if msg.get("type") == "websocket.disconnect":
+                if msg["type"] == "websocket.disconnect":
                     logger.info(f"Client disconnected from WebSocket (code={msg.get('code', '?')})")
                     break
 
-                data = msg.get("bytes")
-
-                if data is not None:
-                    last_audio["t"] = time.time()
-
-                    stats["bytes"] += len(data)
-                    if time.time() - stats["t"] > 5:
-                        logger.info(f"डिवाइस से पिछले 5 सेकंड में {stats['bytes']} बाइट आवाज़ मिली")
-                        stats["bytes"] = 0
-                        stats["t"] = time.time()
-
-                    if audio_q.full():
-                        try:
-                            audio_q.get_nowait()
-                        except asyncio.QueueEmpty:
-                            pass
-
-                    audio_q.put_nowait(data)
+                text = msg.get("text")
+                if text is not None:
+                    parsed = parse_sensor_text(text)
+                    if parsed:
+                        state["sensors"] = parsed
+                        logger.info(f"सेंसर मिले: {text}")
                     continue
 
-                txt = msg.get("text")
-                if txt and txt.startswith("sensor:"):
-                    # सेंसर का डेटा सिर्फ़ सर्वर में रखते हैं, AI को अपने आप नहीं सुनाते
-                    state["sensors"] = parse_sensor_text(txt)
-                    state["sensor_t"] = time.time()
-                    if DEBUG_HEAR:
-                        logger.info(f"खेत का डेटा मिला: {state['sensors']}")
+                data = msg.get("bytes")
+                if not data:
+                    continue
+
+                last_audio["t"] = time.time()
+
+                stats["bytes"] += len(data)
+                if time.time() - stats["t"] > 5:
+                    logger.info(f"डिवाइस से पिछले 5 सेकंड में {stats['bytes']} बाइट आवाज़ मिली")
+                    stats["bytes"] = 0
+                    stats["t"] = time.time()
+
+                if audio_q.full():
+                    try:
+                        audio_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+
+                audio_q.put_nowait(data)
 
         except WebSocketDisconnect as e:
             logger.info(f"Client disconnected from WebSocket (code={getattr(e, 'code', '?')})")
@@ -591,7 +567,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         realtime_config,
                         speech_config if state["speech"] else None,
                         transcribe=(device == "esp32"),
-                        tools=tools,
+                        use_tools=(device == "esp32"),
                     ),
                 ) as session:
 
