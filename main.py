@@ -13,7 +13,8 @@ logger = logging.getLogger("Sahayak_AI")
 app = FastAPI(title="Sahayak AI Voice Backend")
 
 # ======================================================================
-# सहायक AI सर्वर – वर्ज़न 14 (ESP32 वर्ज़न 15 के साथ चलाएँ)
+# सहायक AI सर्वर – वर्ज़न 15 (ESP32 वर्ज़न 17 के साथ चलाएँ)
+# v15: ESP32 अपने बफ़र के हिसाब से बताता है कि आवाज़ कितनी आगे तक भेजनी है (lead)।
 # नया क्या है (v13 से):
 #  1) सेंसर का डेटा AI की याद में चुपचाप जाता है (AI उस पर खुद कुछ नहीं बोलता)। ESP32 हर 5 सेकंड में भेजता है,
 #     सर्वर हर बार नया मान रखता है और मान बदलने पर AI की याद भी अपडेट करता है। चैट चलती रहती है।
@@ -628,6 +629,15 @@ async def live_websocket_endpoint(websocket: WebSocket):
         finally:
             client_gone.set()
 
+    # छोटे बफ़र वाला ESP32 खुद बताता है कि कितना आगे तक भेजना है (मिलीसेकंड में)
+    lead = LEAD
+    try:
+        asked = websocket.query_params.get("lead")
+        if asked:
+            lead = min(LEAD, max(0.1, int(asked) / 1000))
+    except ValueError:
+        pass
+
     async def sender():
         """Gemini की आवाज़ को डिवाइस तक छोटे टुकड़ों में, असली रफ़्तार से (थोड़ा आगे तक) भेजता है।"""
         t0 = 0.0
@@ -650,8 +660,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         sent = 0.0
 
                     ahead = sent - (now - t0)
-                    if ahead > LEAD:
-                        await asyncio.sleep(ahead - LEAD)
+                    if ahead > lead:
+                        await asyncio.sleep(ahead - lead)
 
                     await websocket.send_bytes(frame)
                     sent += len(frame) / BYTES_PER_SEC
