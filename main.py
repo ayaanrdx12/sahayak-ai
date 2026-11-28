@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import time
 import logging
@@ -13,15 +12,14 @@ logger = logging.getLogger("Sahayak_AI")
 app = FastAPI(title="Sahayak AI Voice Backend")
 
 # ======================================================================
-# सहायक AI सर्वर – वर्ज़न 15 (ESP32 वर्ज़न 17 के साथ चलाएँ)
-# v15: ESP32 अपने बफ़र के हिसाब से बताता है कि आवाज़ कितनी आगे तक भेजनी है (lead)।
-# नया क्या है (v13 से):
-#  1) सेंसर का डेटा AI की याद में चुपचाप जाता है (AI उस पर खुद कुछ नहीं बोलता)। ESP32 हर 5 सेकंड में भेजता है,
-#     सर्वर हर बार नया मान रखता है और मान बदलने पर AI की याद भी अपडेट करता है। चैट चलती रहती है।
-#     चैट बंद होते ही सारा डेटा मिट जाता है; नई चैट नए सिरे से पढ़ती है।
-#  2) ESP32 दोबारा जुड़े तो उसका पुराना (अटका हुआ) कनेक्शन तुरंत बंद होता है।
-#  3) ESP32 से बहुत देर तक कुछ न आए तो कनेक्शन बंद माना जाता है।
-#  4) Logs में दिखता है कि ESP32 क्यों दोबारा जुड़ा ("ESP32 की जानकारी")।
+# सहायक AI सर्वर – वर्ज़न 13 (ESP32 वर्ज़न 14 के साथ चलाएँ)
+# नया क्या है (v12 से):
+#  1) खेत के सेंसर: ESP32 हर 5 सेकंड में मिट्टी की नमी, हवा की नमी (+तापमान) और गैस का असली डेटा भेजता है।
+#     सर्वर उसे सिर्फ़ अपने पास रखता है, AI को बार-बार नहीं सुनाता। जब किसान खेत/पानी/नमी/हवा के बारे में
+#     पूछता है, तभी AI "get_farm_sensors" टूल से ताज़ा डेटा पढ़ता है और एक बार जवाब देता है।
+#     जो सेंसर खराब या बंद है, उसे AI अनदेखा करता है और बाकी सेंसर का डेटा इस्तेमाल करता है।
+#  2) आवाज़ टूटना कम: ESP32 की तरफ़ आवाज़ थोड़ी ज़्यादा आगे तक भेजते हैं (AUDIO_LEAD 0.8)।
+#     ध्यान: अगर Render के Environment में AUDIO_LEAD लिखा है तो उसे वहाँ से हटा दें (या 0.8 कर दें)।
 # ======================================================================
 LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.8-live").strip()
 
@@ -54,18 +52,6 @@ LEAD = float(os.getenv("AUDIO_LEAD", "0.8"))
 
 # सेंसर का डेटा इतने सेकंड से पुराना हो जाए तो AI उसे "डेटा नहीं मिल रहा" मानेगा
 SENSOR_STALE_SEC = float(os.getenv("SENSOR_STALE_SEC", "20"))
-
-# 1 = सेंसर का डेटा AI की याद में चुपचाप डालो। इससे कनेक्शन में दिक्कत आए तो Render में SENSOR_CONTEXT=0 करें
-SENSOR_CONTEXT = os.getenv("SENSOR_CONTEXT", "1") == "1"
-# AI की याद कम से कम इतने सेकंड के अंतर से अपडेट हो
-SENSOR_CONTEXT_EVERY = float(os.getenv("SENSOR_CONTEXT_EVERY", "5"))
-# मान कम से कम इतना बदले तभी AI की याद अपडेट करो (हल्के उतार-चढ़ाव से याद न भरे)
-SENSOR_MIN_CHANGE = {"soil": 3.0, "hum": 3.0, "temp": 0.5, "gas": 5.0}
-# ESP32 से इतने सेकंड तक कुछ भी न आए तो कनेक्शन मरा हुआ मानो (वह हर 5 सेकंड में सेंसर भेजता है)
-ESP_IDLE_SEC = float(os.getenv("ESP_IDLE_SEC", "60"))
-
-# हर ESP32 का इस समय चालू कनेक्शन: id -> उसका "बंद करो" संकेत
-active_devices = {}
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -154,21 +140,6 @@ def sensor_report(state):
     return out
 
 
-def sensors_changed(old, new):
-    """पिछली बार AI को बताए डेटा से अब कोई काम का बदलाव है या नहीं।"""
-    if old is None or set(old) != set(new):
-        return True
-    return any(abs(new[k] - old[k]) >= SENSOR_MIN_CHANGE[k] for k in new)
-
-
-def sensor_context_text(state):
-    return (
-        "[खेत सेंसर अपडेट - यह मशीन का अपने-आप आया डेटा है, किसान ने कुछ नहीं बोला। "
-        "इसका कोई जवाब न दें, बस याद रखें। पुराने अपडेट की जगह यही सबसे नया है।] "
-        + json.dumps(sensor_report(state), ensure_ascii=False)
-    )
-
-
 def make_tools():
     """AI को खेत के सेंसर पढ़ने का टूल देता है।"""
     try:
@@ -177,8 +148,6 @@ def make_tools():
                 function_declarations=[
                     types.FunctionDeclaration(
                         name="get_farm_sensors",
-                        # AI पहले डेटा का इंतज़ार करे, फिर जवाब दे
-                        behavior=types.Behavior.BLOCKING,
                         description=(
                             "किसान के खेत में लगे असली सेंसर (मिट्टी की नमी, हवा की नमी, तापमान, हवा में गैस) का ताज़ा डेटा पढ़ता है। "
                             "इसे सिर्फ़ तब बुलाएँ जब किसान अपने खेत की हालत, पानी देने, मिट्टी की नमी, हवा या मौसम के बारे में पूछे। "
@@ -265,11 +234,10 @@ def make_prompt(name, extra=""):
 
 खेती का नियम: आपका लगभग 70 से 80 प्रतिशत ध्यान खेती-किसानी (एग्रीकल्चर) पर रहता है। आप किसानों के भरोसेमंद दोस्त और खेती के जानकार की तरह बात करते हैं। फसल, बीज, मिट्टी, खाद, सिंचाई, कीड़े-बीमारी, मौसम, बागवानी, पशुपालन और मंडी जैसी खेती से जुड़ी किसी भी बात का सवाल आए, तो उसे अच्छे से, पूरे विस्तार से और लंबे-लंबे वाक्यों में समझाएँ। ऐसे सवालों पर 1-2 वाक्य की सीमा नहीं है: कारण, पहचान, ठीक करने का आसान तरीका और सावधानी, सब कुछ सरल भाषा में और किसान को समझ आने वाले उदाहरणों के साथ बताएँ। खेती की बातों में अपनी बात में खेती-किसानी वाले शब्द और वाक्य ज़्यादा रखें। जब मौक़ा सही बैठे तो खेती में मदद की पेशकश भी करें, जैसे "अगर आपकी फसल में कोई दिक्कत हो तो मुझे बताइए, मैं आपकी मदद करूँगा।" अगर फसल की बीमारी या कीड़े की बात हो तो पहले फसल का नाम और क्या लक्षण दिख रहे हैं यह पूछ लें, ताकि सही सलाह दे सकें। दवा या खाद की मात्रा बताते समय लेबल पढ़ने और पास के कृषि विशेषज्ञ या कृषि विज्ञान केंद्र से पूछने की सलाह भी दें। खेती के अलावा दूसरे सवालों के जवाब भी ज़रूर दें, पर उन्हें छोटा रखें।
 
-खेत के सेंसर का नियम: किसान के खेत में असली सेंसर लगे हैं (मिट्टी की नमी, हवा की नमी, तापमान, हवा में गैस)। उनका डेटा आपको बातचीत के बीच "[खेत सेंसर अपडेट ...]" नाम के संदेश में अपने-आप मिलता रहता है, और "get_farm_sensors" टूल से भी सबसे ताज़ा डेटा पढ़ सकते हैं।
-(0) अपडेट संदेश किसान की बात नहीं है। उसका कभी जवाब न दें और अपने-आप उसका ज़िक्र न करें। उसे पूरी बातचीत में याद रखें, सबसे नया अपडेट ही सही मानें, और खेती की सलाह उसी हालत को ध्यान में रखकर दें।
-(1) जब किसान अपने खेत की हालत, पानी देने या न देने, मिट्टी की नमी, हवा की क्वालिटी, गैस, हवा की नमी या तापमान के बारे में पूछे, तो पहले "get_farm_sensors" टूल से ताज़ा डेटा पढ़ें, फिर उसी के हिसाब से जवाब दें। जवाब के बाद, जहाँ काम का हो, उसी डेटा से जुड़ा एक छोटा अगला सवाल पूछें (जैसे फसल कौन सी है, आख़िरी सिंचाई कब हुई)। कभी अंदाज़े से कोई संख्या न बोलें।
+खेत के सेंसर का नियम: आपके पास "get_farm_sensors" नाम का एक टूल है, जो किसान के खेत में लगे असली सेंसर का ताज़ा डेटा देता है (मिट्टी की नमी, हवा की नमी, तापमान, हवा में गैस)।
+(1) यह टूल सिर्फ़ तब बुलाएँ जब किसान अपने खेत की हालत, पानी देने या न देने, मिट्टी की नमी, हवा की क्वालिटी, गैस, हवा की नमी या तापमान के बारे में पूछे (जैसे "मेरा खेत देखकर बताओ पानी डालना है कि नहीं")। ऐसे सवाल पर पहले टूल से डेटा पढ़ें, फिर उसी असली डेटा के हिसाब से जवाब दें। डेटा बिना पढ़े कभी कोई संख्या न बोलें, अंदाज़े से बिल्कुल नहीं।
 (2) सिर्फ़ वही बताएँ जो पूछा गया। अगर पानी का सवाल है तो मिट्टी की नमी के हिसाब से बताएँ और बाकी सेंसर का ज़िक्र न करें। अगर हवा का सवाल है तो सिर्फ़ हवा की बात करें। अगर किसान साफ़ "खेत की पूरी हालत" पूछे, तभी सब चालू सेंसर संक्षेप में एक साथ बताएँ। अगर समझ न आए कि किसान किस चीज़ के बारे में पूछ रहा है, तो एक छोटा सवाल पूछ लें।
-(3) एक ही बार बताएँ। अपने आप से, या दूसरे जवाबों में, बार-बार यह न दोहराएँ कि "आपके खेत में नमी इतनी है, हवा इतनी है"। किसान दोबारा पूछे तभी टूल से नया डेटा लेकर दोबारा बताएँ। खेती की दूसरी बातों में डेटा को ध्यान में रखें, पर संख्याएँ तभी बोलें जब वे उस सवाल से सीधे जुड़ी हों।
+(3) एक ही बार बताएँ। अपने आप से, या दूसरे जवाबों में, बार-बार यह न दोहराएँ कि "आपके खेत में नमी इतनी है, हवा इतनी है"। किसान दोबारा पूछे तभी टूल से नया डेटा लेकर दोबारा बताएँ। खेती की दूसरी बातों के बीच सेंसर की संख्याएँ न घुसाएँ।
 (4) पानी की सलाह का तरीका (मिट्टी की नमी के हिसाब से, यह सिर्फ़ सेंसर वाली एक जगह की नमी है इसलिए इसे अंदाज़ा बताएँ): 30% से कम = मिट्टी सूखी है, सिंचाई की ज़रूरत है; 30% से 60% = ठीक है, ज़्यादातर फसलों को अभी पानी नहीं चाहिए (धान जैसी ज़्यादा पानी वाली फसल को हल्का पानी लग सकता है); 60% से ऊपर = नमी काफ़ी है, पानी न डालें, और बहुत ज़्यादा हो तो जल-जमाव से बचाव बताएँ। सूखी हो तो बताएँ कि नमी अभी कितनी है और लगभग कितनी तक पहुँचानी है, और पानी धीरे-धीरे हल्की सिंचाई से देने को कहें, लीटर की झूठी पक्की संख्या न दें। फसल का नाम पता हो तो उसके हिसाब से सलाह दें, न पता हो तो ज़रूरी लगे तो एक बार पूछ लें।
 (5) हवा में गैस की संख्या जितनी ज़्यादा, हवा उतनी खराब: 30% तक = ठीक, 30% से 60% = थोड़ी खराब, 60% से ऊपर = खराब, खुली जगह या हवादार जगह की सलाह दें। यह सेंसर मोटा अंदाज़ा देता है, डॉक्टरी या पक्की जाँच नहीं।
 (6) टूल के जवाब में अगर कोई सेंसर "kharab_sensor" में हो, तो उसे पूरी तरह अनदेखा करें और बाकी चालू सेंसर से जवाब दें। उस खराब सेंसर का ज़िक्र तभी करें जब किसान ख़ुद उसी के बारे में पूछे, तब सीधे कह दें कि वह सेंसर अभी काम नहीं कर रहा। अगर टूल कहे कि डेटा नहीं मिल रहा या कोई सेंसर चालू नहीं है, तो एक छोटे वाक्य में यही बता दें और अंदाज़े से कोई संख्या न बोलें।
@@ -374,35 +342,6 @@ async def run_session(session, out_q, audio_q, last_audio, state, client_gone):
                     audio=types.Blob(data=SILENCE, mime_type="audio/pcm;rate=16000")
                 )
 
-    async def feed_sensor_context():
-        # सेंसर का डेटा AI की याद में डालता है। turn_complete=False = AI इस पर बोलना शुरू नहीं करता
-        sent = None        # इस Gemini कनेक्शन में AI को आख़िरी बार क्या बताया
-        sent_at = 0.0
-        while True:
-            await asyncio.sleep(0.5)
-            now = time.time()
-            t = state.get("sensor_t")
-            if not t or (now - t) > SENSOR_STALE_SEC:
-                continue
-            # AI बोल रहा हो या किसान अभी बोल रहा हो, तो बीच में कुछ न डालो
-            if state.get("model_busy") or (now - last_audio.get("mic", 0.0)) < 2.0:
-                continue
-            current = dict(state.get("sensors") or {})
-            if sent is not None and (now - sent_at) < SENSOR_CONTEXT_EVERY:
-                continue
-            if not sensors_changed(sent, current):
-                continue
-            await session.send_client_content(
-                turns=types.Content(
-                    role="user",
-                    parts=[types.Part(text=sensor_context_text(state))],
-                ),
-                turn_complete=False,
-            )
-            sent, sent_at = current, now
-            if DEBUG_HEAR:
-                logger.info(f"AI की याद में सेंसर डेटा डाला: {current}")
-
     async def receive_from_gemini():
         while True:
             got_any = False
@@ -466,14 +405,7 @@ async def run_session(session, out_q, audio_q, last_audio, state, client_gone):
                                 logger.info(f"इमोजी भेज रहे हैं: {emoji_name}")
                                 out_q.put_nowait(("text", "emoji:" + emoji_name))
 
-                    if getattr(sc, "interrupted", False):
-                        state["model_busy"] = False
-
-                    if sc.model_turn:
-                        state["model_busy"] = True
-
                     if getattr(sc, "turn_complete", False):
-                        state["model_busy"] = False
                         logger.info("AI का जवाब पूरा हुआ")
                         state["turn_text"] = ""
                         state["emoji_sent"] = False
@@ -495,11 +427,6 @@ async def run_session(session, out_q, audio_q, last_audio, state, client_gone):
         asyncio.create_task(keepalive()),
         asyncio.create_task(receive_from_gemini()),
     ]
-
-    if SENSOR_CONTEXT and state.get("device") == "esp32":
-        tasks.append(asyncio.create_task(feed_sensor_context()))
-
-    state["model_busy"] = False
 
     gone = asyncio.create_task(client_gone.wait())
 
@@ -546,16 +473,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
     out_q = asyncio.Queue()                # Gemini से आई आवाज़ और इमोजी (डिवाइस के लिए)
     client_gone = asyncio.Event()
 
-    # वही ESP32 दोबारा जुड़ा है तो उसका पुराना कनेक्शन बंद करो, ताकि दो Gemini चैट साथ न चलें
-    device_key = None
-    if device == "esp32":
-        device_key = websocket.query_params.get("id", "esp32")
-        old = active_devices.get(device_key)
-        if old is not None:
-            logger.info("यही ESP32 दोबारा जुड़ा: पुराना कनेक्शन बंद कर रहे हैं")
-            old.set()
-        active_devices[device_key] = client_gone
-
     last_audio = {"t": time.time()}
 
     state = {
@@ -575,14 +492,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
     async def read_client():
         try:
             while True:
-                if device == "esp32":
-                    try:
-                        msg = await asyncio.wait_for(websocket.receive(), timeout=ESP_IDLE_SEC)
-                    except asyncio.TimeoutError:
-                        logger.info(f"ESP32 से {int(ESP_IDLE_SEC)} सेकंड से कुछ नहीं आया: कनेक्शन बंद मान रहे हैं")
-                        break
-                else:
-                    msg = await websocket.receive()
+                msg = await websocket.receive()
 
                 if msg.get("type") == "websocket.disconnect":
                     logger.info(f"Client disconnected from WebSocket (code={msg.get('code', '?')})")
@@ -592,7 +502,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
                 if data is not None:
                     last_audio["t"] = time.time()
-                    last_audio["mic"] = last_audio["t"]
 
                     stats["bytes"] += len(data)
                     if time.time() - stats["t"] > 5:
@@ -610,9 +519,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
                     continue
 
                 txt = msg.get("text")
-                if txt and txt.startswith("info:"):
-                    logger.info(f"ESP32 की जानकारी: {txt[5:200]}")
-                    continue
                 if txt and txt.startswith("sensor:"):
                     # सेंसर का डेटा सिर्फ़ सर्वर में रखते हैं, AI को अपने आप नहीं सुनाते
                     state["sensors"] = parse_sensor_text(txt)
@@ -628,15 +534,6 @@ async def live_websocket_endpoint(websocket: WebSocket):
 
         finally:
             client_gone.set()
-
-    # छोटे बफ़र वाला ESP32 खुद बताता है कि कितना आगे तक भेजना है (मिलीसेकंड में)
-    lead = LEAD
-    try:
-        asked = websocket.query_params.get("lead")
-        if asked:
-            lead = min(LEAD, max(0.1, int(asked) / 1000))
-    except ValueError:
-        pass
 
     async def sender():
         """Gemini की आवाज़ को डिवाइस तक छोटे टुकड़ों में, असली रफ़्तार से (थोड़ा आगे तक) भेजता है।"""
@@ -660,8 +557,8 @@ async def live_websocket_endpoint(websocket: WebSocket):
                         sent = 0.0
 
                     ahead = sent - (now - t0)
-                    if ahead > lead:
-                        await asyncio.sleep(ahead - lead)
+                    if ahead > LEAD:
+                        await asyncio.sleep(ahead - LEAD)
 
                     await websocket.send_bytes(frame)
                     sent += len(frame) / BYTES_PER_SEC
@@ -781,12 +678,7 @@ async def live_websocket_endpoint(websocket: WebSocket):
         reader.cancel()
         out_task.cancel()
 
-        if device_key and active_devices.get(device_key) is client_gone:
-            del active_devices[device_key]
-
         try:
-            await asyncio.wait_for(websocket.close(), timeout=3)
+            await websocket.close()
         except Exception:
             pass
-
-        logger.info("चैट बंद: इस चैट का सेंसर डेटा और याद मिट गई")
